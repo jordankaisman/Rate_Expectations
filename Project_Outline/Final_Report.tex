@@ -1,0 +1,707 @@
+%1. Introduction (5 points)
+%• Short introduction to the style of trading, instruments traded, frequencies, etc.
+%• Review of literature on similar strategies and/or analytical techniques used.
+%• Very short overview of the strategy and experimental results.
+
+\section{Introduction}
+Prediction markets (Polymarket, Kalshi) and CME Fed Funds futures both price FOMC policy decisions, but attract different participants, operate under different collateral regimes, and have different microstructure conventions. If both are efficient, they should agree on the expected policy outcome once translated into common units. In practice they do not always agree. We ask whether the disagreement is exploitable, comparing event-contract probabilities from Polymarket and Kalshi \cite{wolfers2004prediction,arrow2008promise} with rates-implied expectations from Fed Funds futures, SOFR futures, and SOFR OIS \cite{kuttner2001monetary,piazzesi2008futures,gurkaynak2007market}.
+
+The informational value of prediction markets for monetary policy has recently been validated by Diercks, Katz and Wright \cite{diercks2026kalshi}, who show that Kalshi-implied distributions are well-calibrated, rapidly updating, and competitive with professional forecasters for FOMC rate decisions, in several cases outperforming Fed Funds futures outright. Their findings establish that prediction markets are a credible source of policy expectations, and motivate the natural follow-up question we address here: if prediction markets and institutional derivatives both embed reliable information, why do they sometimes disagree, and can that disagreement be traded?
+
+Our contribution is an end-to-end, reproducible pipeline that converts both instrument families into a common state variable: the expected basis-point rate change at each meeting. It trades the cross-venue spread in two ways. First, a pure arbitrage strategy that enters when the spread exceeds explicit transaction costs and holds to expiry, locking in the difference. Second, a statistical arbitrage strategy that extracts common factor variation via PCA and trades mean reversion in the residual spread using Ornstein-Uhlenbeck rules, following the framework of Avellaneda and Lee \cite{avellaneda2010statarb}.
+
+
+%2. Model (15 points)
+%• Technical description of and rationale for the strategy, covering alpha, risk, portfolio, etc. • Description of any algorithms/procedures implemented for estimation or other tasks.
+%• Short description of how the model is implemented in Python.
+
+
+\section{Methodology}
+
+\subsection{Overview}
+
+Our methodology builds a meeting-date panel that aligns prediction-market probabilities and rates-market implied expectations in common units of basis-point policy changes, then evaluates two strategy classes under explicit transaction costs. The design is fully causal: signals at date $t$ use only information available by date $t$. OU parameters are lagged one period before use, PCA is fitted on an expanding window, and all imputation uses strictly backward-looking information.
+
+\subsection{Data}
+
+The sample spans May 2023 to January 2026, covering 39 FOMC meetings with Kalshi data and 30 with Polymarket data. In this section we will present the different data sources used to create the arbitrage strategies in this report.
+
+\subsubsection{Polymarket and Kalshi FOMC Contracts}
+
+Polymarket and Kalshi list binary event contracts on discrete FOMC outcomes.
+Each contract settles at \$1 if the outcome occurs and \$0 otherwise.
+Prices are interpreted as risk-neutral probability proxies in $[0,1]$. Raw files contain 9,071 rows; the merged panel covers 2,318/2,484 rows (93\%) across 30 meetings. 
+
+Kalshi lists analogous binary FOMC contracts. Raw files contain 15,759 rows; the merged panel covers 1,582/2,484 rows (64\%) across 24 meetings, with sparse coverage before 2024. The dataset includes \texttt{yes\_bid} and \texttt{yes\_ask} fields used to estimate empirical bid-ask spreads.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.75\linewidth]{polymarket_raw_20251210.pdf}
+    \caption{Polymarket contract probabilities (which are also a proxy of their price) converging to the true value, for the Fed meeting decision on 10 December 2025. The decison was to cut by 25bps.}
+    \label{fig:placeholder}
+\end{figure}
+
+\subsubsection{CME 30-Day Fed Funds Futures}
+
+CME Fed Fund futures settle to $100 - \bar{R}^{EFFR}_M$, the arithmetic average of daily EFFR over calendar month $M$. Daily settlement prices and volumes are sourced from CME.
+
+\subsubsection{CME One-Month SOFR Futures (SR1)}
+
+SR1 futures settle to $100 - \bar{R}^{SOFR}_M$, the arithmetic average of daily SOFR over calendar month $M$, and are structurally analogous to Fed Fund Futures. The SOFR-EFFR basis is treated as approximately constant over short horizons. Daily settlement prices and volumes are sourced from CME with near-dated coverage from 2022 onward.
+
+\subsubsection{SOFR Overnight Index Swaps (OIS)}
+
+SOFR OIS quotes are sourced at standard tenors (1W, 2W, 1M, 2M, 3M, 6M). Data coverage begins in early 2023. Tenors beyond 6 months are excluded as they span too many meetings to provide reliable local signal.
+
+\subsection{\textcolor{red}{Data Engineering and Alignment}}
+
+The merged panel standardizes timestamps to a common daily snapshot — the last observation in each PST/PDT calendar day — and aligns all rows by observation date and FOMC decision date. Missing values are handled by strictly causal imputation: forward carry within each meeting's time series, then backward fill using the historical mean up to but not including the current date. Full implementation details are in Appendix~\ref{app:data_and_alignment}.
+
+\subsection{\textcolor{red}{Panel Modes}}
+
+Five panel modes are evaluated, each combining three base rates assets (\texttt{effr}, \texttt{jump\_sr1}, \texttt{jump\_ois}) with different prediction-market feature sets:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llp{6.5cm}}
+\toprule
+\textbf{Mode} & \textbf{Assets} & \textbf{Description} \\
+\midrule
+\texttt{prediction\_expected}  & 5     & Base + PM expected move only \\
+\texttt{prediction\_grouped}   & 7     & Base + separate hike/cut contributions \\
+\texttt{prediction\_moments}   & 7     & Base + expected move + variance \\
+\texttt{prediction\_moments2}  & 7     & Base + expected move + tail intensity \\
+\texttt{prediction\_all}       & 14--17 & Base + all individual bucket probability-bps products \\
+\bottomrule
+\end{tabular}
+\caption{Panel modes. Default is \texttt{prediction\_grouped}, selected for its balance of granularity and estimation stability.}
+\end{table}
+
+
+%3. Methodology (15 points)
+%Description of data used and preprocessing (source, dates, any issues encountered, etc.).
+%Careful and rigorous description of entire strategy testing scheme, such that strategy is fully reproducible (e.g. in-sample/out-of-sample scheme, any window sizes/dates, trading costs, liquidity considerations, availability of information for trading, signal lag, instrument universe selection, assumptions made for missing data/returns, etc.).
+
+\section{Model I: Pure Arbitrage}
+
+\subsection{Betting on the Rate Decision}
+
+For each FOMC meeting $m$ and observation date $t$, let $H_m$ denote the realized policy-rate change (in basis points) associated with the decision. The latent object of interest is the conditional expectation $\mathbb{E}_t[H_m]$. The modeling problem is to construct multiple estimators of this quantity from different markets, quantify their disagreement, and determine whether trade opportunities exist.
+
+\subsection{Prediction-market: Implied Rate Change}
+
+Prediction contracts are binary claims that settle at \$1 if a specific outcome occurs and \$0 otherwise. Let $p_{i,t}$ denote the contract price (interpreted as a probability proxy) for bucket $i$ observed on date $t$ for some fed decision, and let $h_i$ denote the bucket's assigned policy move in basis points. The expected move estimator is
+\[
+\widehat{H}^{PM}_{t}=\frac{\sum_i h_i\,p_{i,t}}{\sum_i p_{i,t}}.
+\]
+Normalization by total quoted mass is essential because bucket menus are occasionally incomplete, so raw bucket prices may not sum to one. Under the assumption that unquoted outcomes have zero probability, this normalization rescales the available probabilities to sum to one while preserving relative probability ratios.
+
+The assignment of a scalar basis-point value to each bucket follows a canonical mapping. For standard-size buckets (\texttt{C25}, \texttt{H0}, \texttt{H25}, \texttt{H50}), the assignment is unambiguous. For open-ended tail buckets (\texttt{C50+}, \texttt{H50+}, \texttt{C75+}, etc.), we assign the boundary value. In practice the probability is so small that this has a negligible effect.
+
+\subsection{CME 30-Day Fed Funds Futures: Implied Rate Change}
+
+CME 30-Day Fed Funds Futures (\texttt{ZQ}) settle at 100 minus the 
+arithmetic average of the daily EFFR over the delivery month. Let 
+$r_m$ denote the futures-implied average EFFR for calendar month 
+$m$:
+\begin{equation}
+  r_m = 100 - S_m
+\end{equation}
+where $S_m$ is the settlement price of the contract expiring at 
+the end of month $m$.
+
+Let month $m$ contain a decision on day $d$ out of $D$ total days. 
+Let $r^-$ denote the prevailing overnight rate before the decision 
+and $r^+ = r^- + H$ the rate after, where $H$ is the announced 
+change. The monthly average is a weighted average of the pre- and 
+post-decision rates:
+\begin{equation}
+    r_m = \frac{d}{D} r^- + \frac{D-d}{D} r^+
+\end{equation}
+Substituting $r^+ = r^- + H$ and letting $\lambda = d/D$:
+\begin{align}
+    r_m &= \lambda r^- + (1-\lambda)(r^- + H) \\
+        &= r^- + (1-\lambda)H
+\end{align}
+Taking expectations:
+\begin{equation}
+    E[r_m] = E[r^-] + (1-\lambda)\, E[H]
+    \label{eq:decomp}
+\end{equation}
+
+If month $m-1$ contains no decision, the overnight rate is 
+constant throughout that month at $r^-$, so:
+\begin{equation}
+    E[r_{m-1}] = E[r^-]
+\end{equation}
+Substituting into \eqref{eq:decomp} and solving:
+\begin{equation}
+\label{CME}
+\widehat{H}^{\mathrm{CME}} = \frac{r_m - r_{m-1}}{1 - \lambda}
+\end{equation}
+where $r_{m-1}$ and $r_m$ are read directly from the settlement 
+prices of the two corresponding futures contracts.
+
+\begin{figure}[h]
+    \centering
+    \begin{minipage}{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{02_spread_shaded_20250730.pdf}
+    \end{minipage}
+    \hfill
+    \begin{minipage}{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{02_spread_shaded_20250917.pdf}
+    \end{minipage}
+    \caption{Plots of the expected rate change using both instruments we have constructed, with their spread shaded in red, as well as where they expire.}
+\end{figure}
+
+\subsection{Portfolio Construction}
+\subsubsection{DV01 of a Fed Funds Futures Contract}
+
+The actual payout for a fed futures contracts is scaled to mirror the interest earned over one month with interest rate $\bar{R}$. The dollar value of a 1 basis point move is
+\begin{equation}
+  \mathrm{DV01}
+  = N \times \frac{d}{360} \times \frac{1}{10{,}000}
+  = \frac{N \, d}{3{,}600{,}000}
+\end{equation}
+
+where $N = \$5{,}000{,}000$ is the contract notional and $d$ is the number
+of calendar days in the delivery month (actual/360 day-count convention).
+For a 30-day month:
+\begin{equation}
+  \mathrm{DV01} = \frac{5{,}000{,}000 \times 30}{3{,}600{,}000}
+               = \$41.67
+\end{equation}
+We cannot buy a fraction of a future. Therefore to make the instrument defined in equation \ref{CME}, we long/short two futures which correspond to months $m$ and $m-1$. This represents the value $(1-\lambda) \widehat{H}^{\mathrm{CME}}$, giving us the final capital allocation:
+\begin{equation}
+    C_{\text{CME}} = N^{\text{CME}} \cdot \mathrm{DV01} \cdot (r_m - r_{m-1})
+\end{equation}
+Where $N^{\text{CME}}$ is some integer number of contracts that we buy and $\mathrm{DV01}$ was used to convert from bps to dollars. In our backtest we will buy CME contracts one at a time so we set $N^{\text{CME}}=1$.
+
+\subsubsection{Polymarket Replicating Portfolio}
+
+At expiry, the Fed announces outcome $k$, where $k \in \{h_i\}$ is the realized policy move in basis points. The combined P\&L of the two legs under the arbitrage assumption is:
+\begin{equation}
+    \Pi_k = \underbrace{{N^{\text{CME}}} \times h_k \times \mathrm{DV01}}_{\text{CME leg}}
+    - \underbrace{N_k \times \$1}_{\text{PM leg}}
+    = 0
+\end{equation}
+This is satisfied exactly when:
+\begin{equation}
+    N_k = h_k \times \mathrm{DV01}
+    \label{eq:arb_condition}
+\end{equation}
+Where we have set $N^{\text{CME}} =1$ as previously mentioned. That is, for each outcome bucket $k$, hold $h_k \times \mathrm{DV01}$ prediction market contracts. 
+
+As previously explained one CME portfolio pays $\mathrm{DV01} \times (1-\lambda)\, H_0$. To match this on Polymarket,
+we replicate the payoff $(1-\lambda)\,H_0$, which requires
+$\mathrm{DV01} \times (1-\lambda) \times |h_i|$ contracts on each outcome $i$, buying when $h_i > 0$ and selling when $h_i < 0$. The total capital allocated is:
+\begin{equation}
+\label{Cpm}
+  C_{\mathrm{PM}}
+  = \mathrm{DV01}\cdot (1-\lambda) \cdot \left(
+      \sum_{\{i:\, h_i > 0\}} h_i \, p_i
+    + \sum_{\{i:\, h_i < 0\}} |h_i| \, (1 - p_i)
+    \right) \, \$
+\end{equation}
+The first sum is the cost of buying the hike-side contracts,
+the second is the cost of selling (buying the complement of)
+the cut-side contracts. We provide a detailed discussion of the $(1-\lambda$) factor in the Appendix. Its effect can be essentially be ignored in this report, but it would have to be monitored in a full scale implementation of this strategy.
+
+\subsection{Trading Protocol}
+
+We define the spread as,
+\begin{equation}
+    S_{t} = \widehat{H}^{PM}_{t} - \widehat{H}^{CME}_{t},
+\end{equation}
+dropping the month index and noting that every meeting will correspond to a spread. With the portfolios we have constructed, $\widehat{H}^{PM}_{t}$ and $\widehat{H}^{CME}_{t}$ will in theory converge to the true value at expiry of both contracts: the actual rate cut after FOMC meeting. In practice, this may not always be true (see section \ref{effrswing}).
+
+\textbf{Entering the trade:} 
+We enter a trade whenever the spread exceeds the transaction costs (TC)\footnote{These are explained in full detail in section \ref{TCs}. Note that since we do not have to make a round trip, we pay less in transaction costs than in a normal statistical arbitrage set-up.}. Based upon the assumption that prices converge, this will lock in a guaranteed profit of $|S_t - \text{TC}_t|$. Thinking of the spread as a new trading instrument itself, we short the spread if it is overpriced and long it if underpriced.
+
+In our backtest, we found that Kalshi's transaction costs were always too high, notably because of their fee structure, which polymarket does not possess. From here onwards, we will only use polymarket in our backtesting for this strategy.
+
+After the trade has been entered, we wait until expiry and are paid the spread. If any other signal appears, we enter again.
+
+\subsection{Limitations}
+\subsubsection{Expiry at a Non-Zero Spread}
+\label{effrswing}
+The offset between the target rate floor and the daily effective rate is usually constant. There were two consecutive months in recent history where the assumption broke, in which the offset climbed at a roughly linear rate. The total gain was 4 basis points in each month, increasing the average of each month by 2 basis points. Depending on wether we are long or short, this can either help or hurt the strategy.
+
+\subsubsection{Tail Clipping}
+The prediction markets do not offer a full distribution. Instead, due to the rarity of extreme decisions, tails are grouped together as in H50+ and C50+. We will treat H50+ as H50, as that is where most of the actual probability is concentrated. Historically, moves of 75+ are reserved for extreme macroeconomic conditions, and under such circumstances prediction markets will almost certainly update the structure to allow for specific bets on H50 and H75+, or H50, H75, H100+. Our approach flexibly integrates all markets offered for each decision.
+
+\subsubsection{Market impact on Prediction Markets}
+
+The binding constraint is not the capital but the liquidity of the order book. Let $D_i$ denote the depth (in contracts) available at or near the quoted price $p_i$ for outcome~$i$. The replicating portfolio requires $\mathrm{DV01} \times |h_i|$
+contracts on outcome $i$. If this exceeds $D_i$, the marginal contracts fill at worse prices and the effective $E_{PM}$ moves toward $E_F$, shrinking the spread. In practice, the thinnest outcome book is the bottleneck. In this report we will omit any detailed analysis of liquidity, based on the assumption that we are buying a reasonable number of contracts such that they are available, or at least replenish quickly.
+
+\subsubsection{Buying a Single Future}
+In the backtest we only ever buy one CME contract at a time. CME impact cost scales as $N_\text{contracts}$; Polymarket TC scales linearly in $N_\text{contracts}$. At realistic trade sizes (e.g. 10–50 contracts) the Polymarket transaction costs would be the binding constraint.
+
+\section{Results I: Pure Arbitrage}
+
+We present the analytics collected from running the pure arbitrage strategy over all decision months which had good quality data. We have defined the Sharpe ratio per trade (not annualized) as 
+\[
+\text{Sharpe}_{\text{per trade}} = \frac{\bar{r}}{\hat{s}_r}
+\]
+where $\bar{r} = \frac{1}{N}\sum_{i=1}^{N} r_i$ is the mean net P\&L per trade, $\hat{s}_r$ is the sample standard deviation, and $r_i$ is the net P\&L of trade $i$ in USD.
+
+We make an important note that performance analytics in this section are less meaningful than in the statistical arbitrage setting. Since this is a pure arbitrage strategy, one could in principle scale positions arbitrarily to maximise profits — subject to practical constraints such as market impact, liquidity, and transaction costs. In this study we restrict ourselves to the minimum tradeable size on entry, which removes liquidity concerns entirely. Scaling up would be straightforward in principle but would require careful analysis of the constraints above. The results here should therefore be interpreted as a proof of concept demonstrating that the arbitrage opportunity exists, rather than as a realistic estimate of achievable returns at scale.
+
+\begin{figure}[H]
+    \centering
+    \begin{minipage}{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{04_spread_entries_20250730.pdf}
+    \end{minipage}
+    \hfill
+    \begin{minipage}{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{04_spread_entries_20250917.pdf}
+    \end{minipage}
+    \caption{The spread over time (in USD) is plotted with trade entry points marked by color (red for long, green for short). Notably, the September 2025 spread does not settle to zero, illustrating one of the limitations discussed in section \ref{effrswing}. Full plots for all available decision months are provided in the Appendix.}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{} l r @{}}
+\toprule
+Metric & Value \\
+\midrule
+Total trades            & 83 \\
+Wins / Losses           & 56 / 27 \\
+Win rate                & 0.7\% \\
+\midrule
+Total gross PnL         & \$+9,785.51 \\
+Total TC (PM spread)    & \$7,167.95 (0.7\% of gross) \\
+Total net PnL           & \$+2,617.55 \\
+\midrule
+Average gross / trade   & \$117.90 \\
+Average net / trade     & \$+31.54 \\
+Std dev net / trade     & \$66.54 \\
+Sharpe ratio (per trade)& +0.47 \\
+Average days held       & 51.7 \\
+\bottomrule
+\end{tabular}
+\caption{Overall backtest summary.}
+\end{table}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=1\linewidth]{pnl_00_combined.pdf}
+    \caption{The table presents trade-level P\&L for the pure arbitrage strategy. The theoretical P\&L assumes the spread expires at exactly zero, representing the idealized case where both markets converge perfectly at settlement. In practice, realized P\&L can exceed this benchmark. This occurs when the spread moves in our favour during the holding period, increasing the effective spread captured at expiry even if final settlement is not exactly zero.
+    A notable feature of the results is the significant drag from transaction costs (bottom right), which constitute a substantial fraction of total gross revenue. This highlights why the strategy is only viable above a minimum spread threshold, as discussed in the trading protocol.
+    The poor performance in December is attributable to the EFFR offset phenomenon described in Section \ref{effrswing}: the offset drifted during the month, causing the spread to expire at a non-zero value and resulting in a loss.}
+    \label{fig:placeholder}
+\end{figure}
+
+\section{Model II: Statistical Arbitrage Strategy}
+
+\subsection{Overview}
+
+Model II implements a factor-residual statistical-arbitrage framework, combining similar meeting-jump expectations estimated from rates instruments with prediction-market features to remove common components with PCA, and trade mean reversion in residuals using OU-based rules, following Avellaneda and Lee (2010) \cite{avellaneda2010statarb}.
+
+\subsection{Rates-implied jump extraction}
+
+To form the panel of institutional rates, estimators based on 1-month SOFR Futures (SR1) and SOFR OIS swaps are constructed in addition to the CME Fed Funds estimator used above. Estimation of expected jumps using SOFR Futures and OIS Swaps is complicated by contract dates and varied tenors, and as a result we extract meeting jumps using a linear system rather than a naive two-contract decomposition. At each date $t$, instrument rates are represented as
+\[
+y_t = A_t \theta_t + \varepsilon_t,
+\]
+where $A_t$ encodes post-meeting exposure fractions and $\theta_t$ contains baseline and meeting-jump parameters. Estimation uses ridge-stabilized least squares with a small penalty on jump parameters: ($\lambda=10^{-6}$). The resulting jump estimates are directly replicable via pseudoinverse portfolio weights used downstream in execution mapping. Full SR1/OIS construction details, tenor parsing, calendar logic, and weight extraction are in Appendix~\ref{app:statarb_rates_estimator}.
+
+\subsection{Feature panel and residual construction}
+
+The full tradable panel therefore combines the three institutional assets (EFFR, SR1, OIS) with prediction-market derived features. A PCA is then fitted to centered features with $K=3$ retained components, visualized below for the tradeable panel with (i) the full set of Polymarket and Kalshi assets included; and (ii) using composite moment estimators based on the underlying assets. 
+
+\begin{figure}[H]
+    \centering
+    \begin{minipage}{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{pca_loadings_all.png}
+    \end{minipage}
+    \hfill
+    \begin{minipage}{0.45\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{pca_loadings_moments.png}
+    \end{minipage}
+\end{figure}
+
+The first moment is directly interpretable for both decompositions as the shared factor across institutional and prediction markets. This is analogous to the 'market factor' observed in traditional PCA for equities, but here capturing the strongly shared expectations across markets. This explains a large part of the variance: 75\% for the version with moments. The second moment may represent a variance component: note that for the full prediction market decomposition, all the tail probabilities, e.g. Polymarket C50+, have negative weights, whereas the more central moments retain positive weights.
+
+The residual signals based on these factor decompositions then remove the top 'market factor' component to preserve tradable idiosyncratic variance while filtering common macro moves.
+
+The full definitions for the asset decompositions, imputation rules and PCA residual formulas are provided in Appendix~\ref{app:statarb_panel_pca}.
+
+\subsection{OU signal rules and tradability filters}
+
+Residuals are modeled with a rolling AR(1)/OU approximation, with one-period lagged parameters to prevent look-ahead. Following Avellaneda and Lee (2010), baseline thresholds are:
+\begin{itemize}
+    \item Entry/exit bands: $c_{\text{entry}}=1.25$, $c_{\text{exit}}=0.5$.
+    \item Mean-reversion filter: OU half-life $\le 15$ days.
+\end{itemize}
+Position management includes forced flat within 2 days of meeting to avoid possibly high volatility periods in proximity to the meetings. Complete OU formulas and filter hierarchy are in Appendix~\ref{app:statarb_ou_rules}.
+
+\subsection{Execution mapping and P\&L accounting}
+
+Signals are converted to tradable baskets in two layers: (i) PCA residual weights across feature assets and (ii) feature-to-underlying mappings (EFFR contracts, SR1/OIS estimator weights, and prediction buckets). Daily mark-to-market P\&L is computed from entry-locked prices and current closes, then aggregated across active positions and meetings. Sharpe is annualized using 365 periods for calendar-day panels and 252 for business-day-only panels \cite{sharpe1994}.
+
+Exact mapping equations, execution-lag handling, and P\&L aggregation conventions are in Appendix~\ref{app:statarb_execution_pnl}.
+
+
+\section{Results II: Statistical Arbitrage}
+
+The key empirical finding is that the PCA-residual/OU signal is statistically robust and tradable in gross-performance terms \emph{before} transaction costs, but not after realistic execution frictions are applied.
+
+Table 5 shows results from running the statistical arbitrage strategy across various sensitivities. The first four sensitivities: All, grouped, expected and moments relate to different transformations of the underlying prediction market data. Further details can be found in the appendix. Lag 1 implements a one-day execution lag and includes OIS Futures, for which data is only available with a three hour delay. For a trading panel comprised of the other assets, execution delay is not strictly necessary, as discussed in Section 2. Sensitivities Restricted I and II implement strategies which tighten the filtering criteria, leading to significantly fewer trades and transaction costs incurred as a result. Overall however, the transaction costs still outweigh the total profit achieved by almost an order of magnitude. 
+
+\begin{table}[h!]
+\centering
+\begin{tabular}{lrrrrrrr}
+\hline
+\textbf{Metric} & \textbf{Moments} & \textbf{All} & \textbf{Grouped} & \textbf{Expected}  & \textbf{Lag 1} & \textbf{Restricted I} & \textbf{Restricted II} \\
+\hline
+Gross Ann. Sharpe & 0.1308 & 0.1361 & 0.9681 & 0.4834 & -0.3239 & 1.1297 & 1.2968 \\
+Net Ann. Sharpe & -7.2768 & -9.5270 & -10.4375 & -11.1048 & -8.1511 & -9.1969 & -7.5300 \\
+Gross Total Profit & 23.9680 & 19.7338 & 149.2430 & 120.6807 & -49.8619 & 162.2672 & 112.4910 \\
+Net Total Profit & -1588.0788 & -2151.4227 & -2977.4011 & -4899.4637 & -1618.6138 & -2060.1682 & -838.1819 \\
+Total Txn Costs & 1612.0468 & 2171.1565 & 3126.6441 & 5020.1444 & 1568.7519 & 2222.4354 & 950.6729 \\
+Gross Win Rate & 0.5253 & 0.5658 & 0.5714 & 0.5813 & 0.5031 & 0.5938 & 0.6074 \\
+Net Win Rate & 0.1020 & 0.0463 & 0.0278 & 0.0256 & 0.0981 & 0.0339 & 0.0368 \\
+Number of Trades & 990 & 562 & 504 & 664 & 968 & 384 & 163 \\
+Avg Holding Period (days) & 6.5768 & 6.1708 & 6.0317 & 6.1039 & 6.5331 & 6.2708 & 6.2577 \\
+\hline
+\end{tabular}
+\caption{Performance comparison across strategy variants}
+\end{table}
+
+Table 1 shows that gross Sharpe is positive for every asset class considered, including CME-linked legs and both prediction-market venues. This supports the core claim that the methodology identifies a consistent directional-reversion signal in residual space. 
+
+Investigation into costs shows that modeled costs are included, net Sharpe turns strongly negative across all assets. The cost drag is dominated by prediction-market execution (Kalshi and Polymarket spread and fee assumptions), with CME costs materially smaller in comparison. In other words, alpha exists at the signal level, but current market microstructure costs fully absorb it at tradable size.
+
+\subsection{Sensitivity analysis}
+
+We tested a range of alternative specifications around the baseline implementation: stronger entry thresholds, alternative panel constructions (including richer prediction features), and parameter variations in OU/PCA windows and holding constraints. Across these variants, gross performance can move, but the qualitative conclusion is unchanged: realistic transaction costs, especially in prediction markets, eliminate net profitability.
+
+This motivates the transition to the next part of the paper: a pure-arbitrage design in which transaction costs are built directly into opportunity definition and trade selection, rather than treated as a hurdle a statistical signal must overcome ex post.
+
+\section{Transaction costs}
+\label{TCs}
+Transaction costs are modeled separately by venue. 
+\textbf{For prediction-market legs:}
+\begin{itemize}
+    \item \textbf{Bid–ask spread:} Using Kalshi bid–ask data, we approximate the bid–ask spread as a function of days to decision (\ref{fig:kalshi-bidask-dtd}). We use 4-rule approximation for both Kalshi and Polymarket spread costs:
+    \(\text{Bid--ask spread} = 0.05~(\text{days} > 95),\; 0.04~(85 < \text{days} \leq 95),\; 0.03~(45 < \text{days} \leq 85),\; 0.01~(\text{days} \leq 45)\).
+    \begin{figure}[h]
+    \centering
+    \includegraphics[width=0.5\linewidth]{kalshi_spread_rules.png}
+    \caption{Median Kalshi bid--ask spread as a function of days to decision. The piecewise schedule used in the transaction-cost model is based on this empirical relationship.}
+    \label{fig:kalshi-bidask-dtd}
+\end{figure}
+    \item \textbf{Transaction fees:} Polymarket currently does not charge an explicit trading fee (free to trade). Kalshi charges a fee of \(0.07 \times N \times p \times (1 - p)\) per contract, where \(p\) is the mid-price and \(N\) is the number of contracts (rounded up to whole cents).
+    \item \textbf{Total Transaction Cost (one-way):} Transaction Cost (TC) is calculated using: TC = number of contracts $\cdot$ spread + Transaction Fees.
+
+\end{itemize}
+
+\textbf{For CME futures legs:}
+\begin{itemize}
+    \item Market impact cost is modeled as $c = 2 + 15\sqrt{\rho}$ basis points (round-trip), where $\rho$ is the participation rate (traded volume as a fraction of estimated average daily volume for that contract). This formula captures the square-root market-impact law at high participation and a fixed base cost at low participation \cite{almgren2005direct}.
+    \item ADV is sourced from the EFFR and SR1 futures volume fields; for dates or contracts without volume records, a conservative default of 100,000 contracts per day is used.
+\end{itemize}
+
+In CME futures, all costs are charged on both entry and exit events. The pipeline emits reproducible artifacts at each stage: merged expectation panels, residual diagnostics (per-asset $R^2$, half-life, and volatility), OU fit diagnostics, signal trade logs, daily and cumulative P\&L, and per-asset and global summary metrics. All random seeds are fixed and no look-ahead is permitted in any estimation or imputation step. We note that relative to prediction markets transaction costs, the CME transaction costs are ~10x smaller (TC $\approx 0.01$ USD/contract).
+
+\textbf{Kalshi Market Depth and Position-Size Caps.} Volume data is available
+in the Kalshi data for 39 FOMC meetings spanning May~2023--January~2026.
+Dollar volume is computed as $\text{contracts} \times \text{actual midprice}$. Activity is highly concentrated: a small number of
+days around each FOMC announcement drive the bulk of cumulative volume, while
+the median active-trading day is far thinner. Kalshi market liquidity has grown
+substantially through 2025; the three most liquid meetings (Sep, Jul, and
+May~2025) each recorded total dollar volume exceeding \$12M.
+Table~\ref{tab:kalshi-adv} summarises the median daily volume (ADV) by
+ten-day horizon bin for those three meetings.
+
+\begin{table}[h]
+    \centering
+    \caption{Kalshi empirical average daily volume by days-to-decision zone
+             (three most liquid meetings: Sep, Jul, May 2025).}
+    \label{tab:kalshi-adv}
+    \begin{tabular}{lrr}
+        \toprule
+        \textbf{DTD Zone} &
+        \textbf{Median ADV (contracts)} &
+        \textbf{Median ADV (\$)} \\
+        \midrule
+        40--50 d & $\sim$166,951   & $\sim$\$48,659  \\
+        30--40 d & $\sim$307,811   & $\sim$\$92,070  \\
+        20--30 d & $\sim$483,600   & $\sim$\$176,193 \\
+        10--20 d & $\sim$661,269   & $\sim$\$218,849 \\
+         0--10 d & $\sim$2,326,536 & $\sim$\$596,134 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+
+\textbf{Position-Size Cap Rule.}
+To avoid adverse market impact on the prediction market leg, we impose the following
+rule of thumb shown in Table~\ref{tab:kalshi-caps}. These caps apply to the
+three most liquid meetings; for a typical meeting, pooled-median dollar ADV
+falls in the range \$6,000--\$16,000 per day across the 0--40\,d horizon,
+implying proportionally smaller caps. The strategy's risk-adjusted return
+metrics (Sharpe ratio, cumulative PnL) are therefore most meaningful at
+position sizes of \$5,000--\$20,000 per trade for the most liquid meetings,
+and the reported results should be interpreted as demonstrating
+\emph{statistical signal quality} rather than scalable capacity.
+
+\begin{table}[h]
+    \centering
+    \caption{Rule-of-thumb Kalshi position caps (10\% of median ADV,
+             10-day hold; three most liquid meetings).}
+    \label{tab:kalshi-caps}
+    \begin{tabular}{lr}
+        \toprule
+        \textbf{DTD Zone} & \textbf{Max Notional} \\
+        \midrule
+         0--10 d & $\sim$\$59,600 \\
+        10--20 d & $\sim$\$21,900 \\
+        20--30 d & $\sim$\$17,600 \\
+        30--40 d & $\sim$\$9,200  \\
+        40--50 d & $\sim$\$4,900  \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+
+
+\section{Conclusion}
+
+This report develops a cross-market framework for trading disagreement in FOMC policy expectations between prediction markets and institutional rates instruments. We make two main contributions: a pure arbitrage strategy that constructs matched replicating portfolios on each side and locks in the spread at entry, and a statistical arbitrage strategy that extracts idiosyncratic cross-venue disagreement via PCA and trades mean reversion using Ornstein-Uhlenbeck rules.
+
+The pure arbitrage strategy demonstrates that genuine, repeatable mispricings exist between prediction markets and CME futures. This is consistent with the findings of Diercks, Katz and Wright \cite{diercks2026kalshi}, who establish that Kalshi-implied distributions carry real predictive power for FOMC outcomes, making deviations from futures pricing economically meaningful rather than noise. However, the strategy is not purely mechanical in practice. Whether the spread converges to exactly zero at expiry depends on whether the EFFR tracks the target rate floor consistently, a condition that holds most of the time but not always. In this sense the strategy retains a statistical element: it is a high-confidence convergence bet rather than a locked arbitrage. Transaction costs further limit the opportunity, consuming a substantial fraction of revenue even at minimum position sizes. We also abstract away from liquidity, so the reported win rate and P\&L figures should be interpreted as upper bounds on what is achievable in practice rather than definitive performance estimates.
+
+\textcolor{red}{The statistical arbitrage strategy reveals a clear and important finding: a robust gross signal exists in the PCA residual space, confirming that prediction markets and rates markets do not always price the same information in the same way. The PCA decomposition is itself informative: the first component captures the shared macro expectation across all venues, while higher components reflect structural differences in how retail prediction market participants and institutional rates traders form and update their beliefs. However, transaction costs in prediction markets are high enough to fully absorb this signal at any tradable size, rendering the strategy unprofitable net of costs under current market microstructure.}
+
+Together these results point to a broader conclusion. Prediction markets are now sufficiently liquid and well-calibrated to be treated as genuine financial instruments. As prediction market liquidity continues to grow, the strategies developed here are likely to become increasingly viable. More broadly, the framework developed in this report provides a reusable tool for decomposing disagreement between expectation markets, with natural extensions to CPI releases, payroll announcements, and other macro events where prediction markets now offer real-money contracts.
+
+%This report develops a unified cross-market architecture for FOMC expectation trading, linking prediction-market contracts and institutional rates instruments through a common meeting-jump representation. The core contribution is not a single signal, but a reproducible research-to-execution pipeline that combines expectation extraction, factor residualization, OU-based timing, explicit trade mapping, and cost-aware performance attribution.
+
+%Three conclusions follow from the current stage. First, disagreement between venues can be represented in economically interpretable units (basis-point jumps) and in richer distributional coordinates. This supports both simple spread and multi-factor residual strategies. Second, implementation realism materially matters. Execution mapping and commissions are central to viability, not post-hoc adjustments. Third, model diagnostics (fit, half-life, volatility gates) are essential for avoiding mechanically overfit residuals.
+
+%The main limitations are ongoing calibration and external validity. Cost assumptions can evolve with liquidity regimes, sparse contract menus can reduce distributional completeness, and robustness across policy regimes still requires finalized out-of-sample protocols. Immediate extensions include broader liquidity/state conditioning, explicit execution-lag stress tests, and alternative residual models (e.g., state-dependent OU or nonlinear reversion). Subject to these final checks, the framework provides a credible foundation for publishable evidence on cross-venue policy-expectation inefficiencies and their tradability.
+ 
+
+\subsection{Instrument Conventions and Assumptions}
+\label{app:instrument_conventions}
+
+\textbf{Prediction-market contracts.}
+Polymarket and Kalshi list binary event contracts on discrete FOMC outcomes.
+Each contract settles at \$1 if the outcome occurs and \$0 otherwise.
+Prices are interpreted as risk-neutral probability proxies in $[0,1]$.
+
+\textbf{Canonical bucket taxonomy.}
+We map venue-specific labels to a common set of basis-point outcomes:
+\texttt{C50+}, \texttt{C25}, \texttt{H0}, \texttt{H25}, \texttt{H50}, \texttt{H50+}.
+This permits direct expected-bps comparison across venues and against rates instruments.
+
+\textbf{Tail-bucket treatment.}
+Open-ended buckets (\texttt{C50+}, \texttt{H50+}) are assigned boundary values
+for expected-value calculations (e.g., 50 bps). This is an explicit approximation:
+it is accurate when probability mass is concentrated near the boundary and less
+accurate in rare, large-jump regimes.
+
+\textbf{Rates instruments and settlement conventions.}
+Fed Funds (\texttt{ZQ}) and one-month SOFR (\texttt{SR1}) futures settle to
+monthly averages of overnight rates, not a spot print. Therefore, implied
+meeting-jump extraction depends on meeting placement within the month
+(early-month vs late-month meetings). OIS rates are tenor averages that require
+calendar mapping and business-day alignment before extracting meeting-specific
+jumps.
+
+\subsection{Data, Time Alignment, and Coverage}
+\label{app:data_and_alignment}
+
+\subsubsection*{Primary data inputs}
+\begin{enumerate}
+    \item \textbf{Polymarket FOMC contracts:} timestamped outcome-level prices (raw: 9,071 rows).
+    \item \textbf{Kalshi FOMC contracts:} timestamped candles with bid/ask close fields (raw: 15,759 rows).
+    \item \textbf{CME EFFR futures:} settlements, volume, and open interest for \texttt{ZQ}.
+    \item \textbf{CME SOFR futures:} settlements, volume, and open interest for \texttt{SR1}.
+    \item \textbf{SOFR OIS tenors:} cross-sectional quotes (ON, 1W, 2W, 1M, 2M, 3M, 6M, 12M).
+\end{enumerate}
+
+\subsection{Prediction Market Portfolio Example}
+The effective scaling is
+$\mathrm{DV01} \times \alpha = 41.67 \times 0.5 = \$20.83$ per
+basis point:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{} r r l r r @{}}
+\toprule
+Outcome $h_i$ (bp) & Contracts & Direction
+  & Cost per contract (\$) & Total (\$) \\
+\midrule
+$+50$ &  1{,}042 & Buy  & $p_{+50} = 0.05$          &   52 \\
+$+25$ &    521   & Buy  & $p_{+25} = 0.10$          &   52 \\
+$  0$ &      0   & ---  & ---                        &    0 \\
+$-25$ &    521   & Sell & $1 - p_{-25} = 0.30$      &  156 \\
+$-50$ &  1{,}042 & Sell & $1 - p_{-50} = 0.85$      &  886 \\
+\midrule
+\multicolumn{4}{@{}r}{Total capital outlay} & \$1{,}146 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Explaining the $(1-\lambda)$ factor}
+
+The main constraint is that we cannot trade fractional futures on CME. A single future (or rather L/S pair) on CME has 
+\begin{align*}
+    H &= \frac{R_1 - R_0}{1-\lambda}\\
+    (1-\lambda)H &= R_1 - R_0
+\end{align*}
+$(1-\lambda)H$ is actually the smallest denomination attainable. We can replicate this unit in PM. Then we can scale this trade by any integer multiple. 
+
+
+In practice, market microstructure is similar across decisions and so it is reasonable that we would size our bets roughly equally. If $1-\lambda<0.5$, for instance, we could always scale it by an integer $c$ so that $c(1-\lambda)>0.5$. Therefore we can assume that our positions are all scaled by a factor of $\gamma \in [0.5,1]$, so they are all around the same magnitude. For the sake of performance analysis, we neglect this technicality and treat all decisions as if they were sized exactly the same. This makes cumulative PnL a sum of individual decision PnL, which is more convenient. 
+
+If we did not take this into account, we would over-state dollar exposure by $1/(1-\lambda)$.  The ZQ contract
+would actually earn $(1-\lambda) \times \DV$ per bp of rate move (not $\DV$),
+so all reported dollar P\&L figures would be scaled by the partial-month factor:
+\begin{equation}
+  \pi = (1-\lambda) \times \tilde{\pi},
+  \label{eq:lambda_scaling}
+\end{equation}
+applied to gross P\&L, net P\&L, TC, and both legs individually. The scaling factor $(1-\lambda) = (D-d)/D$ is fixed per meeting and is listed in Table~\ref{tab:lambda}.
+
+\begin{table}[h]
+\centering
+\caption{$(1-\lambda)$ scaling factor per FOMC meeting.}
+\label{tab:lambda}
+\begin{tabular}{@{} l c c c @{}}
+\toprule
+Meeting & Day $d$ & Days $D$ & $1-\lambda$ \\
+\midrule
+07 May 2025  &  7 & 31 & 0.774 \\
+30 Jul 2025  & 30 & 31 & 0.032 \\
+17 Sep 2025  & 17 & 30 & 0.433 \\
+29 Oct 2025  & 29 & 31 & 0.065 \\
+10 Dec 2025  & 10 & 31 & 0.677 \\
+28 Jan 2026  & 28 & 31 & 0.097 \\
+18 Mar 2026  & 18 & 31 & 0.419 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The signal check and portfolio construction are performed in full-$H$
+space (unscaled) so that the trading logic is independent of the
+accident of which day of the month the FOMC meets. 
+
+
+\paragraph{Net P\&L with correction (not used in our backtesting):}
+\begin{equation}
+  \pi^\text{net} = (1-\lambda)\,\bigl(\tilde{\pi}^\text{PM}
+                   + \tilde{\pi}^\text{CME} - \text{TC}\bigr).
+  \label{eq:net_pnl}
+\end{equation}
+
+\subsubsection*{Regularized estimation}
+Parameters are estimated via
+\[
+\min_{\theta_t}\|A_t\theta_t-y_t\|_2^2 + \lambda\|\Gamma\theta_t\|_2^2,
+\]
+with $\lambda=10^{-6}$ and $\Gamma$ penalizing jump parameters but not baseline
+$r_0$. This is purely numerical stabilization under near-collinear exposures.
+
+\subsubsection*{SR1 implementation}
+For SR1, each row corresponds to a calendar-month window $[s_i,e_i]$:
+\[
+A_{i,k}=\frac{\#\text{business days in }[\max(s_i,m_k+1),e_i]}
+{\#\text{business days in }[s_i,e_i]},
+\]
+and instrument rate is $y_i=(100-\text{settlement}_i)/100$. Outputs are
+stored as expected rate changes. Meeting-jump portfolio weights are extracted
+from the relevant pseudoinverse rows and stored accordingly.
+
+\subsubsection*{OIS implementation}
+For OIS, tenor codes are parsed into unit/value, maturity dates are computed
+with T+2 spot lag and modified-following calendar rules, and ACT/360 fractions
+define tenor lengths. OIS tenors are capped at 6 months for local meeting-jump
+identification. Outputs are expected jump and portfolio weights following SR1.
+
+\subsection{PCA Details}
+\label{app:statarb_panel_pca}
+\subsubsection*{Causal imputation and residualization}
+Missing values are imputed strictly causally: forward carry within meeting, then
+historical-mean backfill using only prior observations. PCA is fit on centered
+features with $K=3$ components, and trading residuals remove the first one:
+\[
+\hat{u}_{j,t}=x_{j,t}-\hat{\mu}_j-\hat{\lambda}_{j1}f_{1,t}.
+\]
+Rolling fit quality:
+\[
+R_t^2=1-\frac{\overline{u_{j,t}^2}}{\overline{x_{j,t}^2}},
+\]
+with finite values reported only after at least 5 observations.
+
+\subsection{Stat-Arb OU Rules and Filters}
+\label{app:statarb_ou_rules}
+
+\subsubsection*{OU estimation}
+Residuals are modeled with rolling AR(1):
+\[
+u_{t+1}=a+b u_t+\epsilon_{t+1},\quad
+\kappa=-\ln b,\quad
+\mu=\frac{a}{1-b},\quad
+\sigma_{OU}=\sigma_{\epsilon}\sqrt{\frac{2\kappa}{1-b^2}}.
+\]
+Estimates are shifted by one period before trading. Invalid estimates are
+discarded when $b\le0$, $b\ge1-\varepsilon$ ($\varepsilon=10^{-8}$), or
+$\sigma_{OU}\le0$.
+
+\subsubsection*{Entry/exit and risk controls}
+\begin{itemize}
+    \item Entry long: $u_t \le \mu-1.25\sigma_{OU}$.
+    \begin{itemize}
+    \item Sensitivity: $u_t \le \mu-2.5\sigma_{OU}$.
+    \end{itemize}
+    \item Entry short: $u_t \ge \mu+1.25\sigma_{OU}$.
+    \begin{itemize}
+    \item Sensitivity: $u_t \ge \mu+2.5\sigma_{OU}$.
+    \end{itemize}
+    \item Exit long: $u_t \ge \mu-0.5\sigma_{OU}$.
+    \item Exit short: $u_t \le \mu+0.5\sigma_{OU}$.
+    \item Forced flat: close all positions when $t \ge m-2$ days.
+    \item (Sensitivity) Time stop: close after 10 holding days.
+\end{itemize}
+
+\subsection{Stat-Arb Execution and P\&L Details}
+\label{app:statarb_execution_pnl}
+
+\subsubsection*{Two-layer mapping}
+Signal positions in residual units are converted to underlyings by:
+\begin{enumerate}
+    \item PCA residual weights:
+    \[
+    w^{(j)} = e_j - \hat{\Lambda}_{1}\hat{\Lambda}_{1}'e_j.
+    \]
+    \item Feature-to-underlying mapping:
+    EFFR contract mapping, SR1/OIS portfolio weights from matrix estimators,
+    and prediction-bucket mappings via canonical bps map.
+\end{enumerate}
+Combined holding for instrument $\ell$:
+\[
+q_{j,\ell}=\sum_{n=1}^{N} w_n^{(j)} m_{n,\ell}.
+\]
+
+\subsubsection*{Execution timing and mark-to-market}
+Default execution lag is 0 (same-day close), with lag 1 used in sensitivity analysis for
+robustness. Signals without valid execution dates before blackout are dropped.
+Daily P\&L for active positions:
+\[
+\Pi_{j,t}=\sum_{\ell} q_{j,\ell}(P_{\ell,t}-P_{\ell,\tau}),
+\]
+aggregated across positions/meetings into portfolio daily series, cumulative
+P\&L, drawdown, and Sharpe.
+

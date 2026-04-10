@@ -1,0 +1,93 @@
+\documentclass[11pt]{article}
+
+% Margins
+\usepackage[
+    top=0.6in,
+    bottom=0.6in,
+    left=0.6in,
+    right=0.6in
+]{geometry}
+
+% Line spacing
+\usepackage{setspace}
+\setstretch{1.1}   % tighter than 1.5, still readable
+
+% Math
+\usepackage{amsmath, amssymb}
+
+% Links
+\usepackage{hyperref}
+
+% Lists (tight bullets)
+\usepackage{enumitem}
+\setlist[itemize]{noitemsep, topsep=2pt, parsep=0pt, partopsep=0pt}
+\setlist[enumerate]{noitemsep, topsep=2pt, parsep=0pt, partopsep=0pt}
+
+% Paragraph spacing (avoid huge vertical gaps)
+\setlength{\parskip}{4pt}
+\setlength{\parindent}{0pt}
+
+\title{\textbf{Project Outline: Prediction Market Fed Stat Arb}}
+\author{Alexandre Roger, Mark Robinson, Mahmood Alhusseini, Jordan Kaisman, Rami Mrad}
+\date{}
+
+\begin{document}
+\maketitle
+\onehalfspacing
+
+\begin{abstract}
+This project studies how prediction markets and rates markets price upcoming Federal Reserve decisions. We compare explicit outcome probabilities from Polymarket/Kalshi with expectations implied by SOFR futures and OIS curves, and test whether the resulting disagreement is mean-reverting, informative about lead--lag dynamics, and potentially tradable.
+\end{abstract}
+
+\section{Motivation}
+
+Market participants have attempted to anticipate Federal Reserve actions for many years, but prediction markets now offer explicit, tradeable probabilities on discrete FOMC outcomes. Rates markets, by contrast, embed expectations through deep institutional trading in futures and swaps. Comparing these two views offers a clean test of how information is processed and a rare relative-value opportunity. Since both markets ultimately price the same policy decision, we expect long-run alignment, yet short-run dislocations can arise.
+
+In the short-term, divergences can arise because prediction markets are smaller and react quickly to narratives, while rates markets reflect hedging flows, balance-sheet constraints, and embedded risk premia. The two markets may emphasize different parts of the true distribution, incorporate new information differently, and react at different speeds. We will explicitly test whether these gaps mean-revert or persist due to structural frictions.
+
+\begin{center}
+    \textbf{Hypothesis}: Disagreements between the distributions should either mean-revert and/or reveal which market processes information more efficiently. If gaps persist, they likely reflect risk premia or market frictions that we will model and stress-test.
+\end{center}
+
+\section{Data Collection}
+
+The strategy relies on two primary data sources:
+
+Prediction market data comes from Polymarket and Kalshi contracts tied to specific FOMC meetings. These event-based contracts (e.g., ``Fed maintains rate'' or ``Hike $>$25bps'') resolve to $\$1$ if correct and $\$0$ otherwise, so prices provide tradeable probabilities. From these, we construct expected rate changes and full discrete distributions. Data are available via the APIs at daily (and often intraday) frequency for roughly three years of meetings (Polymarket: 32 decisions; Kalshi: 23 decisions). We will document contract mapping, resolution timing, and liquidity flags to avoid stale or thin markets.
+
+Rates market data will be drawn from SOFR futures and SOFR OIS swaps. These instruments do not reference Fed decisions directly, but their prices embed expectations about future overnight rates. We will bootstrap a discount curve and extract implied expectations of the average policy rate between successive FOMC meetings, with careful interpolation where the curve is sparse.
+
+Data must be aligned carefully by calendar date and FOMC meeting such that both markets are pricing the same effective future policy window.
+
+\section{Methodology}
+\subsection{Overview}
+
+The first step is to make expectations comparable across markets. On the prediction market side, expectations can be represented either in reduced form as a probability-weighted expected rate change, or in richer form as a full discrete probability distribution over outcomes. On the rates market side, expectations are extracted from SOFR futures and OIS swaps as implied average policy rates over the window between consecutive FOMC meetings. These objects differ in nature, but they are intended to describe the same underlying future policy decision.
+
+Once aligned by date and meeting, the central challenge becomes quantifying the distance between the two expectation objects. We will explore various approaches, aiming to construct features and measures that are tractable and economically meaningful:
+\begin{itemize}
+    \item \textbf{Mean-based measures}, such as identifying cointegration between point estimates of expected rate changes or implied average policy rates. These are simple and interpretable, but may ignore important distributional information.
+    \item \textbf{Distributional distances}, where the full prediction market probability distribution is compared to an implied distribution inferred from rates markets. Candidates include total variation distance or Kullback--Leibler-type divergences.
+\end{itemize}
+
+Each of these measures induces a synthetic ``spread'' representing disagreement between expectations. This spread is the primary trading signal. The empirical analysis will test whether the spread is stationary or cointegrated across markets, with extensions to non-linear correction dynamics and lead--lag relationships, where one market systematically adjusts first, creating predictable convergence.
+
+Further features can be integrated to construct richer models of cointegration, such as the Fed's own projections, time-to-meeting, or regime indicators like ``rate-cutting cycle'' or ``high-variance decision''.
+
+Backtesting can be conducted in a standardized stat-arb framework. Positions are entered when the disagreement measure deviates sufficiently from historical norms (for example, via $z$-scores) and exited upon partial or full convergence. The spread itself is not directly tradeable (on the traditional market side), so we will map signals to a tradeable combination of swaps/futures; a first pass can ``trade'' the signals themselves to estimate theoretical performance before adding execution costs and slippage.
+
+\subsection{Further considerations}
+
+Key challenges include:
+\begin{itemize}
+    \item \textbf{Small sample size and regime shifts}, since FOMC cycles (hike vs. cut vs. ZLB) can change dynamics and reduce statistical power.
+    \item \textbf{Curve construction and mapping risk}, including interpolation error, meeting-date alignment, and how futures map to discrete decisions.
+    \item \textbf{Liquidity and execution realism}, especially on prediction markets, plus basis risk when hedging with futures/swaps.
+    \item \textbf{Venue and settlement frictions}, such as contract specification changes, regulatory constraints, and tail-event risk around FOMC communications.
+\end{itemize}
+
+Overall, we think this project is an exciting, high-signal test case for statistical arbitrage: it links two markets pricing the same macro outcome but with very different microstructures. The primary challenge lies in defining a meaningful and robust distance between expectation distributions while accounting for execution frictions. Even if a high-Sharpe strategy is not identified, we expect to deliver a well-founded relative-value signal that captures when expectation disagreement is large, structured, and likely to converge, and to clarify when divergences persist for good economic reasons. The signal could still add value by improving risk management and decision-making in broader macro and rates trading frameworks.
+
+
+
+\end{document}

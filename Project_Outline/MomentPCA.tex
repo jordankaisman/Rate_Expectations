@@ -1,0 +1,323 @@
+
+\section{Model II: Statistical Arbitrage Strategy}
+
+\subsection{Overview}
+
+Model II implements a factor-residual statistical-arbitrage framework: estimate meeting-jump expectations from rates instruments, combine them with prediction-market features, remove common components with PCA, and trade mean reversion in residuals using OU-based rules \cite{avellaneda2010statarb}. The implementation is causal and meeting-aware throughout.
+
+\subsection{Rates-implied jump extraction}
+
+Because SR1 and OIS prices average over windows (months/tenors), we estimate meeting jumps using a linear exposure system rather than a naive two-contract decomposition. At each date $t$, instrument rates are represented as
+\[
+y_t = A_t \theta_t + \varepsilon_t,
+\]
+where $A_t$ encodes post-meeting exposure fractions and $\theta_t$ contains baseline and meeting-jump parameters. Estimation uses ridge-stabilized least squares with a small penalty on jump parameters only ($\lambda=10^{-6}$). The resulting jump estimates are directly replicable via pseudoinverse portfolio weights used downstream in execution mapping. Full SR1/OIS construction details, tenor parsing, calendar logic, and weight extraction are in Appendix~\ref{app:statarb_rates_estimator}.
+
+\subsection{Feature panel and residual construction}
+
+The tradable panel combines three rates-implied assets (\texttt{effr\_expected\_bps}, \texttt{jump\_sr1\_bps}, \texttt{jump\_ois\_bps}) with prediction-market features under several panel modes, with \texttt{prediction\_grouped} as default. Missing values are imputed causally (forward carry, then historical-mean backfill). PCA is fit on centered features with $K=3$ retained components; residual signals remove the top one component to preserve tradable idiosyncratic variance while filtering common macro moves.
+
+The full mode definitions, imputation rules, PCA residual formulas, and rolling $R^2$ diagnostics are provided in Appendix~\ref{app:statarb_panel_pca}.
+
+\subsection{OU signal rules and tradability filters}
+
+Residuals are modeled with a rolling AR(1)/OU approximation, with one-period lagged parameters to prevent look-ahead. Baseline thresholds are, following Avellaneda and Lee (2010):
+\begin{itemize}
+    \item Entry/exit bands: $c_{\text{entry}}=1.25$, $c_{\text{exit}}=0.5$.
+    \item Mean-reversion filter: OU half-life $\le 15$ days.
+\end{itemize}
+Position management includes forced flat within 2 days of meeting to avoid possibly high volatility periods in proximity to the meetings. Complete OU formulas, rejection conditions, filter hierarchy, and fallback settings are in Appendix~\ref{app:statarb_ou_rules}.
+
+\subsection{Execution mapping and P\&L accounting}
+
+Signals are converted to tradable baskets in two layers: (i) PCA residual weights across feature assets and (ii) feature-to-underlying mappings (EFFR contracts, SR1/OIS estimator weights, and prediction buckets). Daily mark-to-market P\&L is computed from entry-locked prices and current closes, then aggregated across active positions and meetings. Sharpe is annualized using 365 periods for calendar-day panels and 252 for business-day-only panels \cite{sharpe1994}.
+
+Exact mapping equations, execution-lag handling, and P\&L aggregation conventions are in Appendix~\ref{app:statarb_execution_pnl}.
+
+
+\subsection{Transaction costs, diagnostics, and reproducibility}
+\label{TCs}
+
+Transaction costs are modeled separately by venue. \textbf{For prediction-market legs:}
+\begin{itemize}
+    \item \textbf{Bid–ask spread:} Using Kalshi bid–ask data, we approximate the bid–ask spread as a function of days to decision (\ref{fig:kalshi-bidask-dtd}). We use 4-rule approximation for both Kalshi and Polymarket spread costs:
+    \(\text{Bid--ask spread} = 0.05~(\text{days} > 95),\; 0.04~(85 < \text{days} \leq 95),\; 0.03~(45 < \text{days} \leq 85),\; 0.01~(\text{days} \leq 45)\).
+    \begin{figure}[h]
+    \centering
+    \includegraphics[width=0.5\linewidth]{kalshi_spread_rules.png}
+    \caption{Median Kalshi bid--ask spread as a function of days to decision. The piecewise schedule used in the transaction-cost model is based on this empirical relationship.}
+    \label{fig:kalshi-bidask-dtd}
+\end{figure}
+    \item \textbf{Transaction fees:} Polymarket currently does not charge an explicit trading fee (free to trade). Kalshi charges a fee of \(0.07 \times N \times p \times (1 - p)\) per contract, where \(p\) is the mid-price and \(N\) is the number of contracts (rounded up to whole cents).
+    \item \textbf{Total Transaction Cost (one-way):} Transaction Cost (TC) is calculated using: $TC = number of contracts \cdot spread + Transaction Fees$.
+
+\end{itemize}
+
+\textbf{For CME futures legs:}
+\begin{itemize}
+    \item Market impact cost is modeled as $c = 2 + 15\sqrt{\rho}$ basis points (round-trip), where $\rho$ is the participation rate (traded volume as a fraction of estimated average daily volume for that contract). This formula captures the square-root market-impact law at high participation and a fixed base cost at low participation \cite{almgren2005direct}.
+    \item ADV is sourced from the EFFR and SR1 futures volume fields; for dates or contracts without volume records, a conservative default of 100,000 contracts per day is used.
+\end{itemize}
+
+In CME futures, all costs are charged on both entry and exit events. The pipeline emits reproducible artifacts at each stage: merged expectation panels, residual diagnostics (per-asset $R^2$, half-life, and volatility), OU fit diagnostics, signal trade logs, daily and cumulative P\&L, and per-asset and global summary metrics. All random seeds are fixed and no look-ahead is permitted in any estimation or imputation step. We note that relative to prediction markets transaction costs, the CME transaction costs are ~10x smaller (TC $\approx 0.01$ USD/contract).
+
+\textbf{Kalshi Market Depth and Position-Size Caps.} Volume data is available
+in the Kalshi data for 39 FOMC meetings spanning May~2023--January~2026.
+Dollar volume is computed as $\text{contracts} \times \text{actual midprice}$. Activity is highly concentrated: a small number of
+days around each FOMC announcement drive the bulk of cumulative volume, while
+the median active-trading day is far thinner. Kalshi market liquidity has grown
+substantially through 2025; the three most liquid meetings (Sep, Jul, and
+May~2025) each recorded total dollar volume exceeding \$12M.
+Table~\ref{tab:kalshi-adv} summarises the median daily volume (ADV) by
+ten-day horizon bin for those three meetings.
+
+\begin{table}[h]
+    \centering
+    \caption{Kalshi empirical average daily volume by days-to-decision zone
+             (three most liquid meetings: Sep, Jul, May 2025).}
+    \label{tab:kalshi-adv}
+    \begin{tabular}{lrr}
+        \toprule
+        \textbf{DTD Zone} &
+        \textbf{Median ADV (contracts)} &
+        \textbf{Median ADV (\$)} \\
+        \midrule
+        40--50 d & $\sim$166,951   & $\sim$\$48,659  \\
+        30--40 d & $\sim$307,811   & $\sim$\$92,070  \\
+        20--30 d & $\sim$483,600   & $\sim$\$176,193 \\
+        10--20 d & $\sim$661,269   & $\sim$\$218,849 \\
+         0--10 d & $\sim$2,326,536 & $\sim$\$596,134 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+
+\textbf{Position-Size Cap Rule.}
+To avoid adverse market impact on the prediction market leg, we impose the following
+rule of thumb shown in Table~\ref{tab:kalshi-caps}. These caps apply to the
+three most liquid meetings; for a typical meeting, pooled-median dollar ADV
+falls in the range \$6,000--\$16,000 per day across the 0--40\,d horizon,
+implying proportionally smaller caps. The strategy's risk-adjusted return
+metrics (Sharpe ratio, cumulative PnL) are therefore most meaningful at
+position sizes of \$5,000--\$20,000 per trade for the most liquid meetings,
+and the reported results should be interpreted as demonstrating
+\emph{statistical signal quality} rather than scalable capacity.
+
+\begin{table}[h]
+    \centering
+    \caption{Rule-of-thumb Kalshi position caps (10\% of median ADV,
+             10-day hold; three most liquid meetings).}
+    \label{tab:kalshi-caps}
+    \begin{tabular}{lr}
+        \toprule
+        \textbf{DTD Zone} & \textbf{Max Notional} \\
+        \midrule
+         0--10 d & $\sim$\$59,600 \\
+        10--20 d & $\sim$\$21,900 \\
+        20--30 d & $\sim$\$17,600 \\
+        30--40 d & $\sim$\$9,200  \\
+        40--50 d & $\sim$\$4,900  \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+
+\section{Results II: Statistical Arbitrage}
+
+The key empirical finding is that the PCA-residual/OU signal is statistically robust and tradable in gross-performance terms \emph{before} transaction costs, but not after realistic execution frictions are applied.
+
+Table 1 shows that gross Sharpe is positive for every asset class considered, including CME-linked legs and both prediction-market venues. This supports the core claim that the methodology identifies a consistent directional-reversion signal in residual space. 
+
+Once modeled costs are included, net Sharpe turns strongly negative across all assets. The cost drag is dominated by prediction-market execution (Kalshi and Polymarket spread and fee assumptions), with CME costs materially smaller in comparison. In other words, alpha exists at the signal level, but current market microstructure costs fully absorb it at tradable size.
+
+\subsection{Sensitivity analysis}
+
+We tested a range of alternative specifications around the baseline implementation: stronger entry thresholds, alternative panel constructions (including richer prediction features), and parameter variations in OU/PCA windows and holding constraints. Across these variants, gross performance can move, but the qualitative conclusion is unchanged: realistic transaction costs, especially in prediction markets, eliminate net profitability.
+
+This motivates the transition to the next part of the paper: a pure-arbitrage design in which transaction costs are built directly into opportunity definition and trade selection, rather than treated as a hurdle a statistical signal must overcome ex post.
+
+\section*{Appendix: Statistical Arbitrage Implementation Details}
+
+\subsubsection*{Regularized estimation}
+Parameters are estimated via
+\[
+\min_{\theta_t}\|A_t\theta_t-y_t\|_2^2 + \lambda\|\Gamma\theta_t\|_2^2,
+\]
+with $\lambda=10^{-6}$ and $\Gamma$ penalizing jump parameters but not baseline
+$r_0$. This is purely numerical stabilization under near-collinear exposures.
+
+\subsubsection*{SR1 implementation}
+For SR1, each row corresponds to a calendar-month window $[s_i,e_i]$:
+\[
+A_{i,k}=\frac{\#\text{business days in }[\max(s_i,m_k+1),e_i]}
+{\#\text{business days in }[s_i,e_i]},
+\]
+and instrument rate is $y_i=(100-\text{settlement}_i)/100$. Jump outputs are
+stored as \texttt{jump\_sr1\_bps}. Meeting-jump portfolio weights are extracted
+from the relevant pseudoinverse rows and stored as
+\texttt{jump\_sr1\_portfolio\_weights}.
+
+\subsubsection*{OIS implementation}
+For OIS, tenor codes are parsed into unit/value, maturity dates are computed
+with T+2 spot lag and modified-following calendar rules, and ACT/360 fractions
+define tenor lengths. OIS tenors are capped at 6 months for local meeting-jump
+identification. Outputs are \texttt{jump\_ois\_bps} and
+\texttt{jump\_ois\_portfolio\_weights}.
+
+\subsection{Stat-Arb Panel and PCA Details}
+\label{app:statarb_panel_pca}
+
+\subsubsection*{Panel modes}
+Base assets in all modes:
+\begin{itemize}
+    \item \texttt{effr\_expected\_bps}
+    \item \texttt{jump\_sr1\_bps}
+    \item \texttt{jump\_ois\_bps}
+\end{itemize}
+
+Additional mode-specific assets:
+\begin{enumerate}
+    \item \texttt{prediction\_expected}: add \texttt{polymarket\_expected\_bps}, \texttt{kalshi\_expected\_bps}.
+    \item \texttt{prediction\_grouped}: add \texttt{Poly\_Hike\_bps}, \texttt{Poly\_Cut\_bps}, \texttt{Kalshi\_Hike\_bps}, \texttt{Kalshi\_Cut\_bps}.
+    \item \texttt{prediction\_all} (default): add all per-bucket products ($p_i h_i$ features).
+    \item \texttt{prediction\_moments}: add expected values plus venue tail-intensity features.
+\end{enumerate}
+
+\subsubsection*{Causal imputation and residualization}
+Missing values are imputed strictly causally: forward carry within meeting, then
+historical-mean backfill using only prior observations. PCA is fit on centered
+features with $K=3$ components, and trading residuals remove the first one:
+\[
+\hat{u}_{j,t}=x_{j,t}-\hat{\mu}_j-\hat{\lambda}_{j1}f_{1,t}.
+\]
+Rolling fit quality:
+\[
+R_t^2=1-\frac{\overline{u_{j,t}^2}}{\overline{x_{j,t}^2}},
+\]
+with finite values reported only after at least 5 observations.
+
+\subsection{Stat-Arb OU Rules and Filters}
+\label{app:statarb_ou_rules}
+
+\subsubsection*{OU estimation}
+Residuals are modeled with rolling AR(1):
+\[
+u_{t+1}=a+b u_t+\epsilon_{t+1},\quad
+\kappa=-\ln b,\quad
+\mu=\frac{a}{1-b},\quad
+\sigma_{OU}=\sigma_{\epsilon}\sqrt{\frac{2\kappa}{1-b^2}}.
+\]
+Estimates are shifted by one period before trading. Invalid estimates are
+discarded when $b\le0$, $b\ge1-\varepsilon$ ($\varepsilon=10^{-8}$), or
+$\sigma_{OU}\le0$.
+
+\subsubsection*{Entry/exit and risk controls}
+\begin{itemize}
+    \item Entry long: $u_t \le \mu-1.25\sigma_{OU}$.
+    \item Entry short: $u_t \ge \mu+1.25\sigma_{OU}$.
+    \item Exit long: $u_t \ge \mu-0.5\sigma_{OU}$.
+    \item Exit short: $u_t \le \mu+0.5\sigma_{OU}$.
+    \item Forced flat: close all positions when $t \ge m-2$ days.
+    \item (Sensitivity) Time stop: close after 10 holding days.
+\end{itemize}
+
+\subsubsection*{Tradability filters}
+Baseline gate set:
+\begin{enumerate}
+    \item Half-life $\ln(2)/\kappa \le 5.0$ days.
+    \item (Sensitivity) $R^2 \ge 0.30$.
+\end{enumerate}
+
+\subsection{Stat-Arb Execution and P\&L Details}
+\label{app:statarb_execution_pnl}
+
+\subsubsection*{Two-layer mapping}
+Signal positions in residual units are converted to underlyings by:
+\begin{enumerate}
+    \item PCA residual weights:
+    \[
+    w^{(j)} = e_j - \hat{\Lambda}_{1}\hat{\Lambda}_{1}'e_j.
+    \]
+    \item Feature-to-underlying mapping:
+    EFFR contract mapping, SR1/OIS portfolio weights from matrix estimators,
+    and prediction-bucket mappings via canonical bps map.
+\end{enumerate}
+Combined holding for instrument $\ell$:
+\[
+q_{j,\ell}=\sum_{n=1}^{N} w_n^{(j)} m_{n,\ell}.
+\]
+
+\subsubsection*{Execution timing and mark-to-market}
+Default execution lag is 0 (same-day close), with configurable lag for
+robustness. Signals without valid execution dates before blackout are dropped.
+Daily P\&L for active positions:
+\[
+\Pi_{j,t}=\sum_{\ell} q_{j,\ell}(P_{\ell,t}-P_{\ell,\tau}),
+\]
+aggregated across positions/meetings into portfolio daily series, cumulative
+P\&L, drawdown, and Sharpe.
+
+\subsection{Stat-Arb Costs, Liquidity, and Capacity Constraints}
+\label{app:statarb_costs_liquidity}
+
+\subsubsection*{Transaction-cost model}
+\textbf{Prediction markets:}
+\begin{itemize}
+    \item Polymarket: fee set to zero; spread cost 4\% if DTD$>45$, else 1\%.
+    \item Kalshi: fee $0.07\times N\times p(1-p)$ (rounded up to cents) plus same spread rule.
+\end{itemize}
+
+\textbf{CME futures:}
+\[
+c = 2 + 15\sqrt{\rho}\quad \text{(bps round-trip)},
+\]
+where $\rho$ is participation rate vs ADV. ADV is sourced from futures volume
+fields with conservative default fallback when missing.
+
+All costs are charged on entry and exit.
+
+\subsubsection*{Kalshi liquidity diagnostics}
+Volume coverage includes 39 FOMC meetings (May 2023--Jan 2026). Dollar volume
+is computed as contracts $\times$ actual midprice (median midprice
+$\approx\$0.075$). Liquidity is event-clustered near decisions.
+
+\begin{table}[h]
+    \centering
+    \caption{Kalshi empirical average daily volume by days-to-decision zone
+             (three most liquid meetings: Sep, Jul, May 2025).}
+    \label{tab:kalshi-adv}
+    \begin{tabular}{lrr}
+        \toprule
+        \textbf{DTD Zone} &
+        \textbf{Median ADV (contracts)} &
+        \textbf{Median ADV (\$)} \\
+        \midrule
+        40--50 d & $\sim$166,951   & $\sim$\$48,659  \\
+        30--40 d & $\sim$307,811   & $\sim$\$92,070  \\
+        20--30 d & $\sim$483,600   & $\sim$\$176,193 \\
+        10--20 d & $\sim$661,269   & $\sim$\$218,849 \\
+         0--10 d & $\sim$2,326,536 & $\sim$\$596,134 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsubsection*{Position-size caps}
+Rule-of-thumb capacity caps use 10\% of median ADV with 10-day hold horizon:
+
+\begin{table}[h]
+    \centering
+    \caption{Rule-of-thumb Kalshi position caps (10\% of median ADV,
+             10-day hold; three most liquid meetings).}
+    \label{tab:kalshi-caps}
+    \begin{tabular}{lr}
+        \toprule
+        \textbf{DTD Zone} & \textbf{Max Notional} \\
+        \midrule
+         0--10 d & $\sim$\$59,600 \\
+        10--20 d & $\sim$\$21,900 \\
+        20--30 d & $\sim$\$17,600 \\
+        30--40 d & $\sim$\$9,200  \\
+        40--50 d & $\sim$\$4,900  \\
+        \bottomrule
+    \end{tabular}
+\end{table}

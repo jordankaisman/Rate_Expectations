@@ -1,0 +1,559 @@
+%1. Introduction (5 points)
+%• Short introduction to the style of trading, instruments traded, frequencies, etc.
+%• Review of literature on similar strategies and/or analytical techniques used.
+%• Very short overview of the strategy and experimental results.
+
+\section*{1. Introduction}
+
+This project studies disagreement between two classes of markets that price the same macroeconomic event: Federal Open Market Committee (FOMC) policy decisions. On one side are event contracts listed on Polymarket and Kalshi, which quote explicit probabilities of discrete outcomes (cuts, holds, and hikes in basis-point buckets). On the other side are institutional rates instruments---Fed Funds futures, SOFR futures, and SOFR OIS---which embed expectations of future overnight rates in term prices. The empirical setting is well suited for asking whether two market segments with different participants, collateral regimes, and microstructure conventions produce coherent expectations of the same policy outcome.
+
+The central economic question is an information-integration question: do these venues incorporate public and private signals at comparable speed and with comparable distributional granularity? Under frictionless and fully integrated pricing, cross-venue wedges should be transitory and converge toward a common settlement-consistent expectation. In practice, deviations can persist because of asymmetric inventory constraints, discrete contract menus in prediction markets, heterogeneous arbitrage capital, and execution frictions that vary with distance to meeting date.
+
+The contribution of this report is a fully operational framework that translates heterogeneous instruments into a common state variable and then evaluates disagreement in two layers: (i) directly at the level of expected policy moves, and (ii) at the level of higher-dimensional distributional and curve-shape features. This produces a joint economic and trading interpretation: a wedge can represent either temporary mispricing, compensation for constraints, or a regime-dependent risk premium. The approach is intentionally modular so that data engineering, expectation extraction, signal generation, and execution realism can be stress-tested independently.
+
+We evaluate two complementary strategy classes:
+\begin{itemize}
+    \item \textbf{A direct relative-value spread (``pure arbitrage'' approximation):} compare prediction-market-implied expected moves with futures-implied expected moves and enter only when gross discrepancy exceeds explicit trading-cost thresholds.
+    \item \textbf{A statistical arbitrage strategy:} construct a panel of rates and prediction-market features, extract common components via principal components analysis (PCA), and trade mean reversion in residual spreads with Ornstein--Uhlenbeck (OU) decision rules and meeting-aware risk controls.
+\end{itemize}
+
+The design draws on three strands of literature. The first is prediction-market efficiency and price discovery. The second is extraction of policy expectations from futures and OIS term structures. The third is mean-reversion statistical arbitrage in factor-decomposed spreads. The core empirical premise is that policy-expectation objects inferred from these venues should co-move strongly but need not coincide pointwise in finite samples. The objective is to measure, filter, and trade that discrepancy in a statistically disciplined and implementation-aware way.
+
+
+%2. Model (15 points)
+%• Technical description of and rationale for the strategy, covering alpha, risk, portfolio, etc. • Description of any algorithms/procedures implemented for estimation or other tasks.
+%• Short description of how the model is implemented in Python.
+
+\section*{2. Model}
+
+\subsection*{2.1 Common state variable}
+
+For each FOMC meeting $m$ and observation date $t$, let $H_m$ denote the realized policy-rate change (in basis points) associated with the decision. The latent object of interest is the conditional expectation $\mathbb{E}_t[H_m]$. The modelling problem is to construct multiple estimators of this quantity from different markets, quantify their disagreement, and determine whether disagreement is statistically mean-reverting after accounting for execution costs and position constraints.
+
+We work in a panel indexed by $(m,t)$, where each row represents \emph{what a market believed on date $t$ about meeting $m$}. This panel representation ensures that all signals, filters, and backtest decisions are conditioned on information available strictly before the meeting realization.
+
+\subsection*{2.2 Instruments and market structure}
+
+\subsubsection*{2.2.1 Prediction market contracts on FOMC outcomes}
+
+Polymarket and Kalshi each list a set of binary event contracts for each scheduled FOMC meeting. A binary contract pays \$1 if its specified outcome is realized and \$0 otherwise. Each outcome corresponds to a discrete policy-rate move expressed in basis points. A representative set of Kalshi contracts for a single meeting might include:
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Ticker suffix & Outcome description \\
+\hline
+\texttt{C50+} & Fed Funds Target cut by 50 bps or more \\
+\texttt{C25}  & Cut by exactly 25 bps \\
+\texttt{H0}   & No change (hold) \\
+\texttt{H25}  & Hike by exactly 25 bps \\
+\texttt{H50}  & Hike by exactly 50 bps \\
+\texttt{H50+} & Hike by 50 bps or more \\
+\hline
+\end{tabular}
+\end{center}
+
+Polymarket contracts follow a similar structure but use question-text-derived labels (e.g., ``decreases 25 bps'', ``no change'', ``increases 50+ bps'') mapped into the same canonical taxonomy. The full menu on either platform at any given meeting date reflects which outcomes the platform considers sufficiently probable to list; as probabilities shift over the meeting cycle, the menu can expand or contract.
+
+Two features of the contract design are important for modelling. First, each contract is priced as a probability in the $[0,1]$ interval; under risk neutrality and no friction, the price equals the conditional probability of that outcome. Second, the payoff is determined by the announced Fed Funds target (or target range midpoint), not by overnight market rates---so the settlement benchmark differs from the SOFR or EFFR realized rate on the decision day.
+
+A critical modelling assumption concerns the tail bucket, e.g., \texttt{H50+} or \texttt{C50+}. These contracts aggregate all moves beyond a threshold into a single payoff event, but for the purpose of computing an expected value in basis points, a specific strike must be assigned. We assign the boundary value (50 bps) rather than a larger number, on the basis that the probability mass in the tail buckets during our sample period is concentrated near the boundary. This simplification introduces model error in regimes with unusually large moves; we return to this point in Section 3.
+
+\subsubsection*{2.2.2 The Effective Federal Funds Rate and Fed Funds futures}
+
+The Effective Federal Funds Rate (EFFR) is the volume-weighted average rate on overnight uncollateralized lending between depository institutions, published daily by the Federal Reserve Bank of New York. The FOMC does not directly set EFFR but instead sets a target range (or, historically, a point target) and uses open market operations to keep EFFR within that range. In practice, EFFR tracks the target range midpoint closely.
+
+CME Group lists 30-Day Fed Funds futures (exchange code \texttt{ZQ}) that settle to $100 - \bar{R}^{EFFR}_M$, where $\bar{R}^{EFFR}_M$ is the arithmetic average of daily EFFR prints throughout calendar month $M$. The dollar value of one basis-point move in the settlement price is approximately \$41.67 per contract (reflecting a \$5 million notional and a one-month holding period). These contracts are highly liquid for the front six to eight months of the curve.
+
+Because Fed Funds futures settle on the \emph{monthly average} of EFFR rather than on a spot rate, the information content about a specific FOMC decision depends on when in the month the decision occurs. For a meeting that falls early in the month, a large fraction of that month's EFFR prints will post-date the decision and reflect the new target, so the current-month futures contract is informative about the expected post-meeting rate. For a meeting that falls late in the month---say, on the final days---most of that month's prints will pre-date the decision and the current-month contract contains mostly pre-meeting information; the signal must then be extracted primarily from the next-month contract. This timing structure is the core reason why a simple futures level cannot be read directly as a meeting-jump expectation: expectation extraction requires careful decomposition of the monthly average into pre- and post-meeting segments.
+
+\subsubsection*{2.2.3 SOFR one-month futures (SR1)}
+
+The Secured Overnight Financing Rate (SOFR) is a broad measure of the cost of borrowing cash overnight collateralized by U.S. Treasury securities, calculated by the Federal Reserve Bank of New York as a volume-weighted median of overnight repo transactions. Following the LIBOR transition, SOFR has largely replaced LIBOR as the benchmark for U.S. dollar derivatives and floating-rate products.
+
+CME Group lists SOFR one-month futures (exchange code \texttt{SR1}) that settle to $100 - \bar{R}^{SOFR}_{M}$, the arithmetic average of daily SOFR prints in calendar month $M$, and three-month SOFR futures (\texttt{SR3}) that settle to $100 - \bar{R}^{SOFR}_{Q}$, the compounded average over a three-month IMM quarter. SR1 contracts are analogous in structure to ZQ futures and face the same challenge of extracting meeting-jump information from monthly averages when decisions occur mid-month.
+
+Although SOFR is conceptually a near-perfect credit-free overnight rate, there is a systematic basis between SOFR and EFFR: SOFR has historically traded a few basis points above EFFR on a time-averaged basis due to collateral dynamics and balance-sheet effects, though both track the Fed's target range closely. For expectation extraction, the SOFR-EFFR basis can be treated as approximately constant over the short term, so SOFR futures embed essentially the same FOMC meeting expectations as EFFR futures after this adjustment.
+
+\subsubsection*{2.2.4 SOFR Overnight Index Swaps (OIS)}
+
+A SOFR Overnight Index Swap is an interest-rate swap in which one counterparty pays a fixed rate and receives the daily compounded overnight SOFR over the swap tenor. The fixed rate at which the swap initiates is set so that the contract has zero initial value; this fixed rate is the market's expectation of the geometric average of SOFR over the tenor, adjusted for risk premia and convexity. SOFR OIS has become the primary instrument for pricing term rates in the U.S. dollar market.
+
+In contrast to exchange-traded futures, OIS contracts are quoted across a continuous tenor spectrum (e.g., 1 week, 2 weeks, 1 month, 3 months, 6 months, 12 months), enabling construction of a term structure of rate expectations. Standard market practice extracts FOMC meeting expectations from the OIS curve using bootstrapping: sequential stripping of meeting-jump forwards from OIS rates of adjacent tenors. However, this approach requires precise mapping of instrument maturities to exact calendar dates, alignment of spot-to-maturity periods with business-day conventions, and dense coverage of tenors around each meeting date. In practice, OIS data are subject to stale quotes at off-the-run tenors and the mapping from published tenor points to exact business-day schedules introduces noise that compounds across multiple forward steps.
+
+We discuss our alternative approach to OIS expectation extraction in Section 2.4 below.
+
+\subsection*{2.3 Prediction-market estimator}
+
+Prediction contracts are binary claims that settle at \$1 if a specific outcome occurs and \$0 otherwise. Let $p_{i,m,t}$ denote the contract price (interpreted as a risk-neutral probability proxy) for bucket $i$ at meeting $m$ observed on date $t$, and let $h_i$ denote the bucket's assigned policy move in basis points. The expected move estimator is
+\[
+\widehat{H}^{PM}_{m,t}=\frac{\sum_i h_i\,p_{i,m,t}}{\sum_i p_{i,m,t}}.
+\]
+Normalization by total quoted mass is essential because bucket menus are occasionally incomplete---due to temporarily missing outcomes, stale quotes, or venue-specific listing asymmetries---so raw bucket prices may not sum to one. Under the assumption that unquoted outcomes have zero probability, this normalization rescales the available probabilities to sum to one while preserving relative probability ratios.
+
+The assignment of a scalar basis-point value to each bucket follows a canonical mapping. For standard-size buckets (\texttt{C25}, \texttt{H0}, \texttt{H25}, \texttt{H50}), the assignment is unambiguous. For open-ended tail buckets (\texttt{C50+}, \texttt{H50+}, \texttt{C75+}, etc.), we assign the boundary value as described in Section~2.2.1. The resulting mismatch with institutional instruments that price the full distribution is noted and accounted for in interpreting results.
+
+Beyond the first moment, the model constructs distributional summary statistics from the same bucket set:
+\begin{itemize}
+    \item \textbf{Grouped hike/cut contributions:} the probability-weighted bps of hike buckets only and cut buckets only, giving a directional breakdown of the distribution.
+    \item \textbf{Variance-like feature:} $\text{Var}_{m,t} = \sum_i (h_i - \widehat{H}^{PM}_{m,t})^2 \cdot \tilde{p}_{i,m,t}$, where $\tilde{p}_{i,m,t}$ are normalized probabilities, capturing distributional spread.
+    \item \textbf{Tail-intensity feature:} a weighted sum of $h_i^2$ for non-modal buckets (excluding the two buckets immediately adjacent to the mean), scaled by $1/35$, capturing the probability-weighted contribution of tail contracts.
+\end{itemize}
+These higher-order features are included in the panel for the statistical arbitrage strategy to capture disagreement in distribution shape, not only in the mean expectation.
+
+\subsection*{2.4 Rates-market estimators}
+
+A common feature of all institutional rates instruments is that they represent averages over a calendar period---a month in the case of ZQ and SR1, or a tenor from spot in the case of OIS---rather than providing a direct reading of the post-meeting rate. Since FOMC rate decisions take effect starting from the overnight period after the decision day, the fraction of the instrument's settlement period that reflects the new rate depends on exactly when in that period the decision falls. Expectation extraction therefore requires decomposing the instrument's rate into pre- and post-meeting segments.
+
+\subsubsection*{2.4.1 EFFR Fed Funds futures}
+
+Fed Funds futures settle on the monthly average EFFR, so a meeting-month contract embeds both pre- and post-meeting rate information. Let the meeting occur on day $d$ of a month with $D$ total days, and let $R_0$ be the pre-meeting EFFR level and $R_1 = R_0 + H_m$ the expected post-meeting level. Then the futures-implied average for the meeting month is:
+\[
+F_M = \frac{d}{D} R_0 + \frac{D-d}{D}(R_0 + H_m) = R_0 + \frac{D-d}{D} H_m.
+\]
+Rearranging:
+\[
+\widehat{H}^{EFFR}_{m,t} = (F_M - R_0) \cdot \frac{D}{D-d}.
+\]
+The pre-meeting level $R_0$ is obtained from the previous month's futures contract (for meetings in the first two-thirds of the month) or the current-month contract itself (since most pre-meeting prints are in the current month, and the previous month locks in $R_0$ without contamination). For meetings in the final third of the month (specifically when $d/D > 0.67$), only a small number of post-meeting days remain in the meeting month, making $F_M$ dominated by the pre-meeting rate. In this case, the next-month futures contract becomes the primary vehicle:
+\[
+\widehat{H}^{EFFR}_{m,t} = F_{M+1} - F_{M-1},
+\]
+where $F_{M-1}$ is the previous month's contract (approximating $R_0$) and $F_{M+1}$ is the next month's contract (approximating $R_0 + H_m$ given sufficient remaining days in that month).
+
+This simple algebraic extraction is robust for EFFR because (i) Fed Funds futures are highly liquid across the near-dated contracts, (ii) the day-count convention is straightforward, and (iii) the mapping from date to contract is unambiguous. As a result, the EFFR estimator requires no regularization or model fitting, only contract pairing and arithmetic.
+
+\subsubsection*{2.4.2 SOFR futures and OIS: matrix estimator}
+
+For SOFR and OIS instruments, the same algebraic decomposition as EFFR is complicated by several factors. First, SR1 contracts may have irregular day-count coverage relative to FOMC meeting dates, particularly for meetings in the middle of the month where the exposure fraction is neither approximately zero nor approximately one---making naive two-contract formulas unstable and sensitive to the exact meeting date. Second, OIS tenors are quoted at fixed calendar-day intervals (e.g., 1 month, 2 months) that do not align cleanly with exact FOMC dates, requiring interpolation or re-mapping. Third, both instruments are subject to SOFR-EFFR basis and to stale-quote issues at off-the-run tenors, which can cause naive estimates to drift substantially as the meeting approaches. We verified that the simple EFFR-style approach applied directly to SR1 and OIS produces estimates that are highly volatile and systematically biased toward meeting dates.
+
+The approach we adopt instead treats expectation extraction as a linear system. Consider $N$ instruments (SR1 futures or OIS swap rates) available on observation date $t$ relative to FOMC meeting $m$. Each instrument $i$ has a rate $y_i$ that equals the average overnight rate over a specific calendar window $[s_i, e_i]$. Given FOMC meetings $m_1 < m_2 < \cdots < m_K$ with rate jumps $\Delta r_1, \ldots, \Delta r_K$ and a baseline rate $r_0$ (the overnight rate prevailing before the first meeting in the window), the implied rate for instrument $i$ is:
+\[
+y_i = r_0 + \sum_{k=1}^{K} A_{ik} \Delta r_k + \varepsilon_i,
+\]
+where $A_{ik}$ is the fraction of instrument $i$'s window that falls after the effective date of meeting $k$ (i.e., the proportion of business days in $[s_i, e_i]$ that are on or after $m_k + 1$ day). Stacking instruments gives the matrix system:
+\[
+y_t = A_t \theta_t + \varepsilon_t, \qquad \theta_t = (r_{0,t},\, \Delta r_{1,t},\, \ldots,\, \Delta r_{K,t})'.
+\]
+The exposure matrix $A_t$ is assembled fresh for each observation date from business-day schedules, holiday calendars, and FOMC effective dates. For SR1, each row corresponds to one futures contract covering a specific calendar month; for OIS, each row corresponds to a tenor, with the maturity date computed from the valuation date under ACT/360 conventions with U.S. holiday adjustment.
+
+Estimation solves:
+\[
+\min_{\theta_t} \|A_t \theta_t - y_t\|_2^2 + \lambda \|\Gamma \theta_t\|_2^2,
+\]
+where $\lambda = 10^{-6}$ and $\Gamma$ is a selection matrix that regularizes the jump parameters $\Delta r_k$ but not the baseline rate $r_0$ (since $r_0$ is constrained to be estimated accurately for interpretability). This is a standard ridge-stabilized least-squares problem; it is not a meaningful shrinkage in the economic sense but rather a numerical safeguard against collinear instrument exposures (which can arise when multiple instruments have nearly identical coverage windows). The solution $\hat{\theta}_t$ provides estimates of the baseline rate and all meeting jumps that are jointly consistent with the observed instrument rates on that day.
+
+The portfolio weights underlying the jump estimate for meeting $k$ are the corresponding row of the pseudoinverse of the regularized design matrix, restricted to the real instrument columns (excluding the regularization rows). These weights $w_{k,t} \in \mathbb{R}^N$ represent the linear combination of instrument rates that yields a unit exposure to jump $k$:
+\[
+\hat{\Delta r}_{k,t} = w_{k,t}' y_t.
+\]
+This is important for execution: the same weights specify how to construct a replicating portfolio in actual instruments that provides basis-point-level sensitivity to the meeting jump. For the backtest, these weights are stored as \texttt{jump\_sr1\_portfolio\_weights} and \texttt{jump\_ois\_portfolio\_weights} and used when mapping signal positions to tradable contracts.
+
+The key advantage of this approach over standard OIS bootstrapping is that the resulting jump estimate is by construction a linear combination of observable instrument prices. This means: (i) it can be precisely replicated by a tradable portfolio, which is essential for the pure arbitrage strategy; and (ii) it is well-defined even when the instrument cross-section is not perfectly aligned with meeting dates. The tradeoff is that the estimate may differ from the ``true'' risk-neutral expectation if the system is underdetermined or if instruments carry material risk premia that vary across tenors. In practice, we find the SR1-based estimator to be more stable than the OIS-based one due to higher liquidity and more uniform coverage of FOMC-relevant calendar periods.
+
+\subsection*{2.5 Trading signals and strategy design}
+
+\subsubsection*{2.5.1 Pure arbitrage signal and hedge construction}
+
+The pure arbitrage strategy exploits a direct disagreement between the prediction-market-implied expected move and the futures-implied expected move for the same meeting. The signal is:
+\[
+S_{m,t} = \widehat{H}^{PM}_{m,t} - \widehat{H}^{F}_{m,t},
+\]
+where $\widehat{H}^{F}$ is the EFFR-futures-implied expected move. When $S_{m,t} > 0$, the prediction market implies a larger expected move than the futures market; the strategy sells the prediction market and buys futures.
+
+The hedge construction is designed so that the combined portfolio has a payoff that is independent of the actual FOMC outcome. For a base size of $n$ CME contracts (ZQ, with dollar BPV of \$41.67 per basis point), we define:
+\[
+Q = n \cdot \text{BPV} \cdot h_\text{base}, \qquad h_\text{base} = 25\text{ bps},
+\]
+and assign to each prediction-market bucket $i$ a share quantity:
+\[
+q_i = \text{side} \cdot Q \cdot \frac{h_i}{h_\text{base}} = \text{side} \cdot n \cdot \text{BPV} \cdot h_i,
+\]
+where $\text{side} = -1$ if $S_{m,t} > 0$ (short PM) and $+1$ otherwise. The CME position is $\text{side}_\text{CME} = -\text{side}$ in $n$ contracts.
+
+At settlement, if outcome $k$ is realized (the actual rate move is $h_k$ bps), the prediction-market leg pays:
+\[
+\Pi_\text{PM} = \sum_i q_i \cdot (\mathbf{1}_{i=k} - p_i) = \text{side} \cdot n \cdot \text{BPV} \cdot \left(h_k - \sum_i h_i \tilde{p}_i\right) = \text{side} \cdot n \cdot \text{BPV} \cdot (h_k - \widehat{H}^{PM}),
+\]
+where $\tilde{p}_i$ are normalized probabilities (we have used $q_i = \text{side} \cdot n \cdot \text{BPV} \cdot h_i$ and $\sum_i q_i \tilde{p}_i = \text{side} \cdot n \cdot \text{BPV} \cdot \widehat{H}^{PM}$).
+
+The CME futures leg, settling at the realized futures-implied move $F_k \approx h_k$ bps, pays:
+\[
+\Pi_\text{CME} = -\text{side} \cdot n \cdot \text{BPV} \cdot (F_k - \widehat{H}^{F}) \approx -\text{side} \cdot n \cdot \text{BPV} \cdot (h_k - \widehat{H}^{F}).
+\]
+
+Summing:
+\[
+\Pi_\text{total} = \Pi_\text{PM} + \Pi_\text{CME} = \text{side} \cdot n \cdot \text{BPV} \cdot (\widehat{H}^{F} - \widehat{H}^{PM}) = -\text{side} \cdot n \cdot \text{BPV} \cdot S_{m,t}.
+\]
+Since $\text{side} = -\text{sgn}(S_{m,t})$, we have $\Pi_\text{total} = n \cdot \text{BPV} \cdot |S_{m,t}| > 0$. Crucially, $\Pi_\text{total}$ does not depend on $h_k$: the payoff is the same regardless of the FOMC outcome. This is the sense in which the strategy is a pure arbitrage---once entered, the P\&L is locked in at entry regardless of subsequent outcomes, and realized at settlement (the meeting date). There is no market risk after the trade is placed, only execution risk and the model-error risks discussed below.
+
+The theoretical gross profit per $n=1$ contract is:
+\[
+\Pi_\text{gross} = \text{BPV} \cdot |S_{m,t}| = 41.67 \cdot |S_{m,t}| \text{ USD}.
+\]
+Entry is conditional on $\Pi_\text{gross}$ exceeding all-in transaction costs (prediction-market spreads and fees, plus CME market-impact costs as a function of participation rate relative to ADV). Trades are entered on all qualifying days before the meeting.
+
+\paragraph{Reasons why payoffs may not be exactly identical in practice.}
+The derivation above rests on several assumptions that may fail in practice:
+\begin{enumerate}
+    \item \textbf{Tail-bucket assignment:} We assign a scalar (e.g., $-50$ bps) to the \texttt{C50+} bucket. If the actual move exceeds the boundary (e.g., $-75$ bps), the winning bucket payoff reflects the correct move in the CME leg, but the prediction-market leg assigns that bucket weight $h_i = -50$ rather than $-75$. This creates a mismatch of $n \cdot \text{BPV} \cdot 25$ bps in the PM leg for each such extreme outcome.
+    \item \textbf{Normalization of probabilities:} If the quoted bucket prices do not fully cover the outcome space (e.g., a bucket is missing), the normalized expected value assumes zero probability on the omitted bucket. If the omitted bucket has nonzero probability, the hedge is incomplete.
+    \item \textbf{EFFR--futures settlement mapping:} The CME leg settles on the \emph{monthly average} EFFR, not directly on the meeting-day rate. Our EFFR expectation estimator accounts for this, but any estimation error in $\widehat{H}^F$ propagates directly into an unhedged residual.
+    \item \textbf{Timing and execution slippage:} The hedge is entered at quoted prices which may change between observation time and execution, creating imprecision in the struck position.
+\end{enumerate}
+These risks are bounded and generally small relative to the spread for profitable trades, but they mean the strategy approximates rather than achieves a textbook pure arbitrage.
+
+\subsubsection*{2.5.2 Statistical arbitrage residual signal}
+
+The statistical arbitrage strategy relaxes the requirement for a direct two-leg hedge. Instead, it seeks to trade mean reversion in a residual spread constructed by removing common factor variation from a panel of expectation features.
+
+Let $x_{m,t} \in \mathbb{R}^N$ be a feature vector containing rates-implied jump estimates and prediction-market-derived expectation features. PCA is applied to causally imputed and centered features:
+\[
+x_{m,t} = \Lambda f_{m,t} + u_{m,t},
+\]
+where $f_{m,t}$ are $K$ common factors capturing shared variation and $u_{m,t}$ is the idiosyncratic residual. The number of retained factors is three by default ($K=3$). Residuals are obtained by projecting out the top-two factors:
+\[
+\hat{u}_{m,t} = x_{m,t} - \hat{\Lambda}_{1:2} f_{m,t}^{(1:2)}.
+\]
+Only the first two factors are subtracted (rather than all three estimated) to ensure the residuals retain meaningful variance for trading; the third factor serves as a check on fit quality.
+
+Each residual series is then modelled as a discrete-time Ornstein--Uhlenbeck (OU) process:
+\[
+u_{t+1} = a + b\, u_t + \epsilon_{t+1}, \qquad \kappa = -\ln b, \quad \mu = \frac{a}{1-b}, \quad \sigma_{OU} = \sigma_\epsilon \sqrt{\frac{2\kappa}{1-b^2}}.
+\]
+OU parameters are estimated on rolling windows within each meeting's time series using ordinary least squares (regressing $u_{t+1}$ on $u_t$). Parameters are lagged by one period before use in trading decisions to prevent look-ahead. Entry and exit bands are set at $\mu \pm c_\text{entry} \cdot \sigma_{OU}$ and $\mu \pm c_\text{exit} \cdot \sigma_{OU}$ respectively, with $c_\text{entry} = 1.5$ and $c_\text{exit} = 0.5$.
+
+For the statistical arbitrage strategy, profit is not locked in at entry. Instead, P\&L accrues gradually as the residual mean-reverts, and positions must be actively closed. The expected gross profit per trade, under the OU model, is $2(c_\text{entry} - c_\text{exit}) \sigma_{OU} \cdot \text{BPV}$ per contract, but this is realized only if and when the residual crosses the exit band. Forced closure near meeting dates prevents positions from riding through the decision event, limiting tail risk from model failure at resolution.
+
+\subsubsection*{2.5.3 PCA factor structure and intuition}
+
+The choice to perform PCA on \emph{levels} of the expectation features (rather than on daily changes) is deliberate. The features---expected move estimates, distributional moments, and rates-derived jumps---are conditioned on a specific meeting $m$ and evolve smoothly as the meeting approaches. Within a meeting cycle, these series share strong common trends (e.g., all measures respond jointly to economic data releases), but their relative levels capture structural disagreements that are more persistent and tradable than day-to-day changes. Using levels within each meeting's window also avoids the problem of losing initial observations to differencing and preserves the mean-reversion structure of residuals.
+
+The expected factor structure in this panel is as follows:
+\begin{itemize}
+    \item \textbf{First factor:} A common ``market rate'' factor capturing the overall expected rate change as priced across all instruments. This reflects the broad consensus and co-moves strongly with EFFR futures, OIS rates, and the prediction-market expected value simultaneously.
+    \item \textbf{Second factor:} A cross-venue spread factor capturing systematic divergence between prediction markets and institutional rates, potentially reflecting differences in the population of marginal traders, collateral treatment, or access costs on each platform.
+    \item \textbf{Higher factors:} Distributional shape factors capturing the difference in tail probability assessments or the spread of the distribution around the mean. These are expected to be informative when the market is genuinely uncertain (bimodal distributions) versus when a single outcome is near-certain.
+\end{itemize}
+By projecting out the first two common factors and trading residuals, the strategy avoids taking a directional view on the expected rate move (captured by the first factor) and instead trades only the idiosyncratic cross-venue disagreement. This is important for risk management: the position has near-zero net exposure to the actual FOMC decision direction.
+
+\subsection*{2.6 Selection, risk controls, and execution mapping}
+
+Tradability of a residual series is imposed as a conjunction of three filters:
+\begin{enumerate}
+    \item \textbf{Fit quality:} the rolling PCA residualization $R^2$ (computed as $1 - \text{var}(u)/\text{var}(x)$) must exceed a minimum threshold (0.30). This ensures that the factor model explains a meaningful share of variation, so residuals represent genuine idiosyncratic content.
+    \item \textbf{Mean-reversion speed:} the estimated OU half-life $\ln(2)/\kappa$ must not exceed 5 days. This ensures the residual is expected to revert within the available meeting window and that the OU approximation is economically relevant.
+    \item \textbf{Minimum volatility:} the residual standard deviation must exceed 25\% of the cross-sectional median residual standard deviation. This prevents entering positions in nearly-flat spreads where the signal-to-noise ratio is too low and transaction costs would dominate.
+\end{enumerate}
+
+Signals passing these filters are mapped to executable baskets using two layers of weights:
+\begin{enumerate}
+    \item \textbf{PCA residual weights:} the null-space weight vector $w \in \mathbb{R}^N$ derived from the PCA components, specifying each feature asset's contribution to the residual spread.
+    \item \textbf{Per-asset underlying weights:} for each feature asset, a mapping to the physical instruments it represents (specific EFFR futures contracts, SR1 futures contracts, OIS tenors, or prediction-market buckets), using the portfolio weights stored from the matrix estimators and the canonical prediction-market mappings.
+\end{enumerate}
+Combining these two layers gives the full executable basket for each signal position in underlying instruments. This basket is used for both cost-realistic mark-to-market and for specifying the actual trade instructions in the implementation.
+
+
+%3. Methodology (15 points)
+%Description of data used and preprocessing (source, dates, any issues encountered, etc.).
+%Careful and rigorous description of entire strategy testing scheme, such that strategy is fully reproducible (e.g. in-sample/out-of-sample scheme, any window sizes/dates, trading costs, liquidity considerations, availability of information for trading, signal lag, instrument universe selection, assumptions made for missing data/returns, etc.).
+
+\section*{3. Methodology}
+
+\subsection*{3.1 Data and calendar alignment}
+
+\subsubsection*{3.1.1 Overview of data sources}
+
+The empirical panel is built from five primary datasets:
+
+\begin{enumerate}
+    \item \textbf{Polymarket FOMC contracts:} a CSV file containing timestamped contract observations for Polymarket binary outcome contracts linked to FOMC decisions, covering approximately 30 FOMC meetings. Raw files contain \textbf{9,071} rows before filtering.
+    \item \textbf{Kalshi FOMC contracts:} a CSV file containing Kalshi FOMC contract data including \texttt{yes\_bid\_close\_dollars}, \texttt{yes\_ask\_close\_dollars}, and candle timestamps. Raw files contain \textbf{15,759} rows before filtering.
+    \item \textbf{CME EFFR Fed Funds futures:} daily settlement prices, volumes, and open interest for ZQ (30-Day Fed Funds) contracts, used for EFFR-based expectation extraction.
+    \item \textbf{CME SOFR futures:} daily settlement prices, volumes, and open interest for SR1 (1-month SOFR) contracts, used for the SR1 matrix estimator.
+    \item \textbf{SOFR OIS quotes:} a cross-section of SOFR OIS rates at standard tenors (overnight, 1W, 2W, 1M, 2M, 3M, 6M, 12M), used for the OIS matrix estimator.
+\end{enumerate}
+
+\subsubsection*{3.1.2 Timestamp standardization}
+
+A key design choice is to define the daily observation for each contract as the last recorded price on each calendar day, using a common timezone convention to ensure consistency across venues. Prediction market timestamps are Unix epoch values (UTC) and are converted to the America/Los\_Angeles timezone (PST/PDT) for calendar-day assignment. For rates instruments, the daily settlement price is provided by CME with an explicit calendar date under exchange convention, which corresponds to the end of the US trading day (approximately 3--5pm Eastern Time).
+
+Polymarket markets are created at 8pm ET; to ensure that historical price data is captured from as early as 5pm ET on the market creation date, the data-fetch window is extended backward by 3 hours (10,800 seconds) relative to the market creation timestamp. The Kalshi candle timestamps (\texttt{candle\_ts}) and Polymarket observation timestamps (\texttt{observed\_ts}) are converted to PST calendar dates as follows:
+
+\begin{enumerate}
+    \item Parse the raw Unix timestamp as UTC.
+    \item Convert to America/Los\_Angeles timezone to obtain the local PST/PDT date.
+    \item Assign the local PST/PDT date as the \texttt{observed\_day\_pst} field.
+\end{enumerate}
+
+The last intraday observation within each PST calendar day is retained as the daily snapshot. Since US financial markets close at approximately 3--5pm ET (6--8pm PST in winter) and prediction markets continue trading in the evening, the PST end-of-day observation captures the post-US-market-close equilibrium price. This is broadly consistent with the CME end-of-day settlement, providing a coherent point-in-time comparison across venues.
+
+The practical effect of this alignment is important for FOMC days: prediction market contracts continue to trade in the hours after the 2pm ET FOMC announcement, so the daily PST observation captures post-announcement price discovery. The strategy correctly avoids entering positions on or after the decision date.
+
+\subsubsection*{3.1.3 Data coverage and completeness}
+
+After merging and filtering to canonical outcome labels and valid timestamps, the prediction market coverage is:
+\begin{itemize}
+    \item In the merged panel, Polymarket covers \textbf{2,318 / 2,484} rows (\textbf{93\%}) across all \textbf{30} meetings, with good coverage from 2023 onward and near-complete coverage for recent meetings.
+    \item Kalshi covers \textbf{1,582 / 2,484} rows (\textbf{64\%}) across \textbf{24} meetings, with sparse coverage for early meetings and more complete records from 2024 onward.
+    \item Main gaps arise from: (i) sparse early Kalshi history before 2024, (ii) venue-specific bucket definitions that prevent clean mapping for some legacy contract types, and (iii) stale or missing mid-day quotes on some days.
+\end{itemize}
+
+For rates instruments, the EFFR futures dataset provides daily coverage from 2022 onward for near-dated contracts (up to 6--8 months forward), with volume and open interest fields used to select the most active contract when multiple series share a month-year expiry. The SOFR SR1 futures dataset has similarly good near-dated coverage. OIS data coverage begins in early 2023, with the full tenor spectrum (1W to 12M) available from mid-2023, and occasional missing tenors at off-the-run points.
+
+\subsection*{3.2 Prediction-market preprocessing}
+
+\subsubsection*{3.2.1 Canonical outcome mapping}
+
+Both Polymarket and Kalshi use platform-specific contract identifiers and question-text formats that must be mapped to a shared canonical outcome taxonomy before cross-venue combination. The canonical labels follow a prefix convention: \texttt{C} for cuts (negative moves) and \texttt{H} for hikes/holds (non-negative moves), followed by the basis-point magnitude (e.g., \texttt{C25}, \texttt{H0}, \texttt{H50+}).
+
+For Kalshi, canonical labels are derived from the last component of the ticker string after the final hyphen (the ``variant token''). The mapping is:
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Variant token & Canonical label \\
+\hline
+\texttt{C24} & \texttt{C50+} \\
+\texttt{C25} & \texttt{C25} \\
+\texttt{C26} & \texttt{C50+} \\
+\texttt{C>25} & \texttt{C50+} \\
+\texttt{H0} & \texttt{H0} \\
+\texttt{H25} & \texttt{H25} \\
+\texttt{H26} & \texttt{H50+} \\
+\texttt{H50} & \texttt{H50} \\
+\texttt{H>25} & \texttt{H50+} \\
+\texttt{TC25}, \texttt{TH50} & \texttt{C25}, \texttt{H50} \\
+\hline
+\end{tabular}
+\end{center}
+
+For Polymarket, canonical labels are derived by parsing the English question text using regex patterns (e.g., ``decreases 25 bps'' $\to$ \texttt{C25}, ``increases 50+ bps'' $\to$ \texttt{H50+}, ``no change'' $\to$ \texttt{H0}). A fallback mapping from the \texttt{rate\_move\_label} field covers rows where question-text parsing fails. Any variant token or label not present in the mapping tables is logged and excluded from the panel.
+
+\subsubsection*{3.2.2 Daily last-observation aggregation}
+
+Multiple intraday quote records may exist for the same contract and calendar day. For each unique combination of (\texttt{decision\_date}, \texttt{observed\_day\_pst}, \texttt{canonical\_label}, \texttt{venue}), the record with the latest \texttt{observed\_ts} value is retained. This produces a unique daily observation per contract, consistent with the 5pm ET snapshot design.
+
+\subsubsection*{3.2.3 Cross-meeting date alignment}
+
+Kalshi contracts reference FOMC meetings by a coded key (e.g., \texttt{KXFEDDECISION-25JUN}) that encodes the year and month of the meeting. Polymarket contracts carry an explicit \texttt{decision\_date} field. To align the two venues, a YYMMM mapping (five-character year-month string such as ``25JUN'') is constructed from Polymarket's \texttt{decision\_date} values, and Kalshi keys are mapped to \texttt{decision\_date} via this lookup. In the event of duplicate keys (two Polymarket meetings mapping to the same YYMMM code), the earliest date is used and a warning is logged.
+
+\subsubsection*{3.2.4 Wide-format pivot and feature construction}
+
+After aggregation, the long-format table (one row per venue/date/label/meeting combination) is pivoted to wide format, producing columns \texttt{polymarket\_<label>} and \texttt{kalshi\_<label>} for each canonical outcome. These columns contain the mid-quote price (average of bid and ask for Kalshi; the \texttt{close\_price} field for Polymarket).
+
+From the wide table, the following derived features are computed for use in the statistical arbitrage panel:
+\begin{itemize}
+    \item \textbf{Expected basis-point move} (\texttt{polymarket\_expected\_bps}, \texttt{kalshi\_expected\_bps}): probability-weighted sum of canonical outcome labels, normalized by total probability mass.
+    \item \textbf{Grouped hike/cut contributions} (\texttt{Poly\_Hike\_bps}, \texttt{Poly\_Cut\_bps}, \texttt{Kalshi\_Hike\_bps}, \texttt{Kalshi\_Cut\_bps}): sum of $p_i \times h_i$ separately for hike buckets ($h_i > 0$) and cut buckets ($h_i < 0$), giving a two-sided directional decomposition.
+    \item \textbf{Variance feature} (\texttt{polymarket\_variance\_asset}, \texttt{kalshi\_variance\_asset}): $\sum_i \tilde{p}_i (h_i - \bar{h})^2$, the probability-weighted squared deviation from the mean.
+    \item \textbf{Tail weight feature} (\texttt{polymarket\_tail\_weight\_bps}, \texttt{kalshi\_tail\_weight\_bps}): constructed by excluding the two buckets immediately adjacent to the current mean (one on each side) and summing $p_i \cdot h_i^2 / 35$ for the remaining tail buckets.
+    \item \textbf{Per-bucket probability-bps products} (\texttt{polymarket\_<label>\_bps}, etc.): for each individual bucket, the product $p_i \times h_i$, used in the \texttt{prediction\_all} panel mode.
+\end{itemize}
+
+\subsection*{3.3 Rates preprocessing and expectation extraction}
+
+\subsubsection*{3.3.1 EFFR futures}
+
+The EFFR extraction pipeline reads the raw CME data file, parses settlement prices as $\text{implied\_rate} = (100 - \text{settlement})/100$, and links each contract to its FOMC meeting using the \texttt{LastTrdDate} field (which encodes the last trading day, typically at end of contract month). For each meeting date $m$:
+
+\begin{itemize}
+    \item If $m$ is a late-month meeting ($m_\text{day}/D_m > 0.67$, where $D_m$ is days in the month): the pre-meeting leg uses the current-month contract and the post-meeting leg uses the next-month contract.
+    \item If $m$ is an early-to-mid-month meeting: the pre-meeting leg uses the previous-month contract, and the post-meeting level is algebraically extracted from the current-month contract:
+\[
+R_\text{post} = \frac{F_M \cdot D_m - R_\text{pre} \cdot m_\text{day}}{D_m - m_\text{day}},
+\]
+where $F_M$ is the current-month settlement rate.
+\end{itemize}
+
+This produces a daily panel of EFFR-implied expected rate changes in basis points (\texttt{effr\_expected\_bps}). Holiday treatment is implicit: settlement prices are published only on business days, so observation dates with no settlement record produce missing values that are not forward-filled.
+
+\subsubsection*{3.3.2 SOFR SR1 matrix estimator}
+
+For each observation date with available SR1 contract settlements, the matrix estimator constructs the exposure matrix $A_t$ as follows. Each row corresponds to one SR1 contract covering calendar month $[s_i, e_i]$ (where $s_i$ is the first day of the month and $e_i$ is the last day). Given FOMC meetings at dates $m_1, \ldots, m_K$ (all of which fall within the forecast horizon), the meeting-$k$ exposure for contract $i$ is:
+\[
+A_{i,k} = \frac{\text{business days in } [\max(s_i,\, m_k + 1),\, e_i]}{\text{business days in } [s_i,\, e_i]},
+\]
+where $m_k + 1$ is the effective date of meeting $k$ (the next business day after the decision). The baseline exposure $A_{i,0} = 1$ for all contracts. The instrument rates are $y_i = (100 - \text{settlement}_i)/100$.
+
+The regularized system $\|A_t\theta - y_t\|^2 + \lambda \|\Gamma\theta\|^2$ is solved with $\lambda = 10^{-6}$ and $\Gamma$ penalizing only the jump parameters (not the baseline rate $r_0$). The solution provides meeting-jump estimates in decimal form; these are multiplied by 10,000 to obtain basis-point values (\texttt{jump\_sr1\_bps}).
+
+Portfolio weights for each meeting-$k$ jump estimate are the corresponding row of the pseudoinverse restricted to the real instrument rows, normalized so that applying the weight vector to the instrument rate vector produces the basis-point jump estimate. These weights are stored as JSON in \texttt{jump\_sr1\_portfolio\_weights} and used downstream for execution mapping.
+
+\subsubsection*{3.3.3 SOFR OIS matrix estimator}
+
+OIS data are structured as a sequence of (tenor, rate) pairs on each observation date. Tenor codes follow the Reuters/Refinitiv convention (e.g., \texttt{USDSROIS1M=} for 1-month SOFR OIS, \texttt{USDSROIS3M=} for 3-month). The pipeline:
+\begin{enumerate}
+    \item Parses the tenor code to extract the unit (D, W, M, Y) and value.
+    \item Computes the maturity date from the observation date using a T+2 spot-lag convention, modified-following day-count adjustment, and U.S. holiday calendar.
+    \item Computes the ACT/360 year fraction from the observation date to maturity to obtain the tenor in months (\texttt{tenor\_months}).
+    \item Caps OIS tenors at 6 months for the expectation extraction (instruments beyond 6 months capture rate expectations spanning too many meetings to provide reliable local signal).
+\end{enumerate}
+
+The exposure matrix construction follows the same logic as SR1, but with instrument $i$'s window defined as $[t, \text{maturity}_i]$ rather than a calendar month. The ACT/360 day-count ensures consistency with OIS pricing conventions. Portfolio weights and jump estimates are stored analogously to SR1 and labeled \texttt{jump\_ois\_bps} and \texttt{jump\_ois\_portfolio\_weights}.
+
+\subsubsection*{3.3.4 Panel merge and final data assembly}
+
+The EFFR, SR1, and OIS pipelines run independently and are merged into the prediction-market panel on (\texttt{decision\_date}, \texttt{observed\_day\_pst}) keys. Left-join semantics are used: every (meeting, date) pair present in the prediction data is retained, with rates estimates filled as missing if the corresponding rates data are unavailable. The final merged panel forms the input to the statistical arbitrage strategy.
+
+\subsection*{3.4 Feature panel construction and PCA residualization}
+
+\subsubsection*{3.4.1 Panel modes}
+
+From the merged panel, the \texttt{build\_asset\_panel} function selects a specific set of feature columns depending on the chosen \texttt{panel\_mode}. Three base assets are common to all modes:
+\begin{itemize}
+    \item \texttt{effr\_expected\_bps}: EFFR futures-implied expected meeting jump (bps).
+    \item \texttt{jump\_sr1\_bps}: SR1 matrix estimator-implied meeting jump (bps).
+    \item \texttt{jump\_ois\_bps}: OIS matrix estimator-implied meeting jump (bps).
+\end{itemize}
+
+Five modes are evaluated in the analysis, representing different levels of prediction-market granularity:
+
+\begin{enumerate}
+    \item \textbf{\texttt{prediction\_expected}:} 5 assets = 3 base + [\texttt{polymarket\_expected\_bps}, \texttt{kalshi\_expected\_bps}]. The simplest mode, including only the first-moment expected-value summaries from each platform.
+    \item \textbf{\texttt{prediction\_grouped}:} 7 assets = 3 base + [\texttt{Poly\_Hike\_bps}, \texttt{Poly\_Cut\_bps}, \texttt{Kalshi\_Hike\_bps}, \texttt{Kalshi\_Cut\_bps}]. Separates hike and cut contributions, allowing the PCA to identify directional asymmetries between platforms.
+    \item \textbf{\texttt{prediction\_all}:} 3 base + all individual probability-$\times$-bps products for each listed bucket. This is the richest granularity---typically 14--17 assets---and enables the factor structure to capture detailed cross-venue and cross-outcome disagreements, at the cost of higher dimensionality and potential instability.
+    \item \textbf{\texttt{prediction\_moments}:} 7 assets = 3 base + [\texttt{polymarket\_expected\_bps}, \texttt{kalshi\_expected\_bps}, \texttt{polymarket\_variance\_asset}, \texttt{kalshi\_variance\_asset}]. Adds second-moment distributional features to the expected-value view, capturing distributional spread disagreements.
+    \item \textbf{\texttt{prediction\_moments2}:} 7 assets = 3 base + [\texttt{polymarket\_expected\_bps}, \texttt{kalshi\_expected\_bps}, \texttt{polymarket\_tail\_weight\_bps}, \texttt{kalshi\_tail\_weight\_bps}]. Replaces variance with the tail-intensity feature, targeting disagreement in the tails of the distribution rather than overall spread.
+\end{enumerate}
+
+The default mode is \texttt{prediction\_grouped} (7 assets, $K=3$ retained components), as it balances granularity and stability.
+
+\subsubsection*{3.4.2 Causal imputation}
+
+Missing values in the feature panel are handled by strictly causal imputation: first, a forward carry of the last observed value within each meeting's time series; second, a backward fill using the historical mean of observed values for that feature up to (but not including) the current date. This design preserves the constraint that no future information is used in construction of the feature panel.
+
+\subsubsection*{3.4.3 PCA fitting and residualization}
+
+PCA is fitted on the causally imputed, centered panel of features for each meeting's time series. Two options are available: full-history PCA (using all available data up to the current date as the estimation window) and rolling PCA (using a fixed rolling window of $W$ days). The default is full-history PCA. Components are fitted via scikit-learn's \texttt{PCA} class, with component count $K=3$.
+
+The residual for each feature $j$ and time $t$ is computed as:
+\[
+\hat{u}_{j,t} = x_{j,t} - \hat{\mu}_j - \sum_{k=1}^{2} \hat{\lambda}_{jk} f_{kt},
+\]
+where the projection uses only the first two components (the third component's loadings are computed but not subtracted, preserving residual variance for trading signal generation).
+
+Rolling $R^2$ quality of residualization is computed as:
+\[
+R^2_t = 1 - \frac{\overline{u_{j,t}^2}}{\overline{x_{j,t}^2}},
+\]
+where the bars denote either rolling-window or expanding-window sample means, with a minimum of 5 observations required before reporting a finite value.
+
+\subsection*{3.5 OU signal estimation and trade rules}
+
+\subsubsection*{3.5.1 OU parameter estimation}
+
+For each residual series and each meeting's time series, OU parameters are estimated on rolling windows of 22 days using the discrete-time AR(1) regression:
+\[
+u_{t+1} = a + b \, u_t + \epsilon_{t+1}.
+\]
+The parameters are obtained via ordinary least squares within each meeting's chronological sequence. All parameter estimates ($a$, $b$, $\kappa = -\ln b$, $\mu = a/(1-b)$, and $\sigma_{OU}$) are shifted forward by one period before use in trading decisions, ensuring that today's signal uses only yesterday's estimated parameters (strict causal discipline). Parameters are rejected and treated as missing if $b \leq 0$, $b \geq 1 - \varepsilon$ with $\varepsilon = 10^{-8}$ (indicating non-mean-reverting or near-unit-root dynamics), or $\sigma_{OU} \leq 0$.
+
+\subsubsection*{3.5.2 Tradability filters}
+
+A residual series is eligible for trading on a given day only if all of the following conditions hold simultaneously:
+
+\begin{enumerate}
+    \item \textbf{Minimum $R^2$:} rolling $R^2 \geq 0.30$. This ensures the factor model is adequately explaining shared variation so the residual represents a genuine idiosyncratic spread.
+    \item \textbf{Maximum half-life:} $\ln(2)/\kappa \leq 5.0$ days. This ensures the OU process is expected to revert within the available trade horizon before the meeting blackout.
+    \item \textbf{Minimum volatility:} residual standard deviation $\geq 0.25 \times \widetilde{\sigma}$, where $\widetilde{\sigma}$ is the cross-sectional median residual standard deviation across all assets on that day. This prevents entering positions in near-flat spreads where transaction costs would dominate.
+\end{enumerate}
+
+If fewer than one-third of residuals pass the strict filters, a fallback relaxation is applied (minimum $R^2$ reduced to 0.10, maximum half-life increased to 10 days, entry sigma reduced to $[0.5, 1.0]$, exit sigma to 0.2, volatility threshold to 0.10$\times$ median). The fallback is documented in the output and used only to avoid fully degenerate empty-output runs; results under fallback should be interpreted cautiously.
+
+\subsubsection*{3.5.3 Entry and exit rules}
+
+Entry and exit decisions are based on OU bands computed from estimated parameters:
+\begin{itemize}
+    \item \textbf{Entry long:} when $u_t \leq \mu - 1.5 \sigma_{OU}$ (residual is 1.5 standard deviations below mean).
+    \item \textbf{Entry short:} when $u_t \geq \mu + 1.5 \sigma_{OU}$ (residual is 1.5 standard deviations above mean).
+    \item \textbf{Exit long:} when $u_t \geq \mu - 0.5 \sigma_{OU}$ (residual reverts to within 0.5 standard deviations of mean).
+    \item \textbf{Exit short:} when $u_t \leq \mu + 0.5 \sigma_{OU}$ (symmetric exit for short).
+    \item \textbf{Forced flat:} all positions are closed unconditionally if the observation date is within 2 calendar days of the meeting date (i.e., $t \geq m - 2$ days). This prevents riding through the event itself and the overnight settling period.
+    \item \textbf{Time stop:} all positions are closed after a maximum holding period of 10 days, regardless of residual level. This limits the carrying cost and risk of positions that fail to revert within the expected timeframe.
+\end{itemize}
+
+Position size is unit (1.0) for each residual asset; all sizing and scaling is handled at the basket mapping stage. Trades are logged with event type, decision date, observation date, position, and cumulative P\&L in basis-point units.
+
+\subsection*{3.6 Tradable basket mapping and P\&L accounting}
+
+\subsubsection*{3.6.1 Two-layer weight mapping}
+
+Signal positions (in units of standardized residual bps) are converted to underlying tradable quantities through a two-layer mapping:
+
+\begin{enumerate}
+    \item \textbf{PCA residual weight vector:} For each signal asset $j$, the residual weight vector $w^{(j)} \in \mathbb{R}^N$ gives the loading of each panel feature on residual asset $j$. This is derived from the null-space projection of the PCA loadings: $w^{(j)} = e_j - \hat{\Lambda}_{1:2} \hat{\Lambda}_{1:2}' e_j$, where $e_j$ is the $j$-th standard basis vector. The elements of $w^{(j)}$ specify how much of each feature asset to hold per unit of residual position.
+    
+    \item \textbf{Feature-to-underlying mapping:} Each feature asset is mapped to its constituent physical instruments:
+    \begin{itemize}
+        \item \texttt{effr\_expected\_bps}: mapped to EFFR futures contracts via the date-dependent weight formula (scale = $D_m/(D_m - m_\text{day})$ for early-month meetings), using contract labels \texttt{EFFR\_YYYY\_MM}.
+        \item \texttt{jump\_sr1\_bps}: mapped to specific SR1 futures contracts via the stored \texttt{jump\_sr1\_portfolio\_weights} JSON field from the matrix estimator.
+        \item \texttt{jump\_ois\_bps}: mapped to OIS instruments via \texttt{jump\_ois\_portfolio\_weights}.
+        \item Prediction market features: mapped to individual prediction contract probabilities via the \texttt{PREDICTION\_BPS\_MAP} canonical lookup, with each bucket allocated proportionally to its bps weight.
+    \end{itemize}
+\end{enumerate}
+
+Combining both layers, the holding in underlying instrument $\ell$ for a unit long position in residual $j$ is:
+\[
+q_{j,\ell} = \sum_{n=1}^{N} w^{(j)}_n \cdot m_{n,\ell},
+\]
+where $m_{n,\ell}$ is the weight of instrument $\ell$ within feature asset $n$.
+
+\subsubsection*{3.6.2 Execution timing}
+
+Trades are executed at the next available observation date satisfying the execution-time condition. The default execution lag is 0 days (same-day execution at the closing price on the signal date). A configurable lag of 1 or more days can be set for robustness analysis. If no valid execution date exists within the meeting window (e.g., the meeting is imminent and the blackout period activates), the signal is discarded.
+
+\subsubsection*{3.6.3 Mark-to-market and daily P\&L}
+
+For each active position, daily mark-to-market P\&L is computed from the entry prices locked at the execution date and the current closing prices of the underlying instruments. The basket P\&L for a unit long position in residual $j$ entered at time $\tau$ and evaluated at time $t > \tau$ is:
+\[
+\Pi_{j,t} = \sum_\ell q_{j,\ell} \cdot (P_{\ell,t} - P_{\ell,\tau}),
+\]
+where $P_{\ell,t}$ is the closing price of instrument $\ell$ on date $t$. Underlying prices are sourced from the same EFFR, SR1, and OIS datasets used in the expectation extraction, and from the prediction-market daily pivot tables for prediction-market legs.
+
+Daily P\&L is aggregated across all active positions and meetings to produce a portfolio-level daily series. Cumulative P\&L, maximum drawdown, and daily Sharpe ratio are computed from this series. The Sharpe ratio is annualized using 365 periods per year when the panel contains weekend and holiday observations (the default case, since prediction market prices are available on non-trading days) and 252 periods per year for business-day-only panels. This convention is implemented by detecting whether weekend dates are present in the observation index. The 365-period convention is appropriate here because residual mean-reversion can occur on any calendar day (prediction market prices update continuously), so calendar days rather than trading days represent the natural measurement unit for this panel.
+
+\subsection*{3.7 Transaction costs, diagnostics, and reproducibility}
+
+Transaction costs are modeled separately by venue. For prediction-market legs:
+\begin{itemize}
+    \item \textbf{Polymarket:} No explicit fee (currently free to trade). A bid-ask spread cost of 4\% of notional for observations more than 45 days before the decision, and 1\% for observations within 45 days.
+    \item \textbf{Kalshi:} Fee of $0.07 \times N \times p \times (1-p)$ per contract where $p$ is the mid-price and $N$ is the number of contracts (rounded up to whole cents). The same two-zone spread rule (4\% beyond 45 days, 1\% within 45 days) applies.
+\end{itemize}
+
+For CME futures legs:
+\begin{itemize}
+    \item Market impact cost is modeled as $c = 2 + 15\sqrt{\rho}$ basis points (round-trip), where $\rho$ is the participation rate (traded volume as a fraction of estimated average daily volume for that contract). This formula captures the square-root market-impact law at high participation and a fixed base cost at low participation.
+    \item ADV is sourced from the EFFR and SR1 futures volume fields; for dates or contracts without volume records, a conservative default of 100,000 contracts per day is used.
+\end{itemize}
+
+All costs are charged on both entry and exit events. The pipeline emits reproducible artifacts at each stage: merged expectation panels, residual diagnostics (per-asset $R^2$, half-life, and volatility), OU fit diagnostics, signal trade logs, daily and cumulative P\&L, and per-asset and global summary metrics. All random seeds are fixed and no look-ahead is permitted in any estimation or imputation step.
+
+
+\section*{4. Results}
+
+\subsection*{4.1 Current empirical status}
+
+The full evaluation stack is operational and currently produces, for each run, daily P\&L paths, cumulative P\&L, trade-level logs, residual-selection diagnostics, OU diagnostics, and global performance summaries (gross and net of modeled commissions). Thus, the report now has a complete measurement framework even while final calibration and robustness sweeps remain in progress.
+
+\subsection*{4.2 First-pass interpretation framework}
+
+The final results section will be organized around four layers:
+\begin{enumerate}
+    \item \textbf{Cross-market expectation alignment:} level and dynamics of prediction-market versus rates-implied expected moves over meeting time.
+    \item \textbf{Signal quality and selection:} distribution of residual $R^2$, half-life, and volatility gates; share of candidate spreads passing filters.
+    \item \textbf{Trading outcomes:} trade count, holding profile, gross and net Sharpe, drawdown path, and decomposition of commission drag by venue.
+    \item \textbf{Regime attribution:} performance conditional on distance to meeting, volatility regimes, and directional policy regimes (hiking, cutting, hold-dominant episodes).
+\end{enumerate}
+
+\subsection*{4.3 Preliminary findings to date}
+
+At this draft stage, the key result is methodological: the strategy can be carried from raw quote data to executable, cost-aware backtests with transparent diagnostics at every step. The framework already supports side-by-side comparison of a direct spread strategy and a PCA/OU residual strategy under harmonized cost assumptions. Final numerical claims are intentionally deferred until transaction-cost calibration is fully finalized and sensitivity grids (window length, entry/exit bands, and execution lag) are locked.
+
+\section*{5. Conclusion}
+
+This report develops a unified cross-market architecture for FOMC expectation trading, linking prediction-market contracts and institutional rates instruments through a common meeting-jump representation. The core contribution is not a single signal, but a reproducible research-to-execution pipeline that combines expectation extraction, factor residualization, OU-based timing, explicit trade mapping, and cost-aware performance attribution.
+
+Three conclusions follow from the current stage. First, disagreement between venues can be represented in economically interpretable units (basis-point jumps) and in richer distributional coordinates. This supports both simple spread and multi-factor residual strategies. Second, implementation realism materially matters. Execution mapping and commissions are central to viability, not post-hoc adjustments. Third, model diagnostics (fit, half-life, volatility gates) are essential for avoiding mechanically overfit residuals.
+
+The main limitations are ongoing calibration and external validity. Cost assumptions can evolve with liquidity regimes, sparse contract menus can reduce distributional completeness, and robustness across policy regimes still requires finalized out-of-sample protocols. Immediate extensions include broader liquidity/state conditioning, explicit execution-lag stress tests, and alternative residual models (e.g., state-dependent OU or nonlinear reversion). Subject to these final checks, the framework provides a credible foundation for publishable evidence on cross-venue policy-expectation inefficiencies and their tradability.
